@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -19,11 +20,17 @@ type browserObservation struct {
 	title       string
 	status      string
 	console     string
-	// tabs maps a tab's address to the line Playwright rendered for it.
-	tabs      map[string]string
+	// tabs maps a tab's list index to the line Playwright rendered for it,
+	// without the current marker; two tabs on one address stay distinct.
+	tabs map[string]string
+	// activeTab identifies the current tab by index and address, without
+	// its title, so a same-page title change is not a tab switch.
 	activeTab string
 	// downloads holds the completed files already reported for this page.
 	downloads map[string]bool
+	// artifacts holds the files Playwright wrote into the output directory,
+	// so a directory scan reports only user downloads.
+	artifacts map[string]bool
 	// refs maps an element reference to its snapshot line, and lines counts
 	// every non-empty snapshot line, with or without a reference.
 	refs  map[string]string
@@ -73,8 +80,12 @@ var (
 	pageHTTPStatus = regexp.MustCompile(`(?m)^- HTTP status: (.+)$`)
 	pageConsole    = regexp.MustCompile(`(?m)^- Console: (.+)$`)
 	openTabsBlock  = regexp.MustCompile(`(?ms)^### Open tabs\n(.+?)(?:\n### |\z)`)
-	openTabLine    = regexp.MustCompile(`^- \d+: (?:\(current\) )?\[(.*)\]\((.*)\)(?: \[crashed\])?$`)
+	resultBlock    = regexp.MustCompile(`(?ms)^### Result\n(.+?)(?:\n### |\z)`)
+	openTabLine    = regexp.MustCompile(`^- (\d+): (?:\(current\) )?\[(.*)\]\((.*)\)(?: \[crashed\])?$`)
 	snapshotBlock  = regexp.MustCompile("(?s)### Snapshot\\n```yaml\\n(.*?)\\n```")
+	downloadEvent  = regexp.MustCompile(`(?m)^- Downloaded file .+ to "([^"\n]+)"\r?$`)
+	markdownLink   = regexp.MustCompile(`\]\(([^)\n]+)\)`)
+	consoleLog     = regexp.MustCompile(`^console-.*\.log$`)
 )
 
 // observeAction records one Playwright result and, for a same-page
@@ -87,22 +98,31 @@ func (p *browserPages) observeAction(name string, result json.RawMessage, output
 	texts := resultTexts(result)
 	snapshots := snapshotTexts(texts)
 	if len(snapshots) == 0 {
-		p.observeTabs(texts)
+		p.observeTabs(name, texts)
+		p.observeArtifacts(texts, output)
 		return result
 	}
 
 	current := observationFromText(texts, snapshots)
-	current.downloads = setOf(scanDownloads(output, texts))
 	p.mu.Lock()
 	before := p.observation
-	switch {
-	case current.tabs == nil && current.url == before.url && before.hasSnapshot:
-		// A result without an Open tabs section does not mean the tabs
-		// closed; it means the tab headers did not change.
-		current.tabs, current.activeTab = before.tabs, before.activeTab
-	case current.tabs == nil:
-		current.tabs, current.activeTab = singleTab(current.url, current.title)
+	p.mu.Unlock()
+
+	mergeArtifacts(&current, before)
+	current.downloads = setOf(scanDownloads(output, texts, current.artifacts))
+	if current.tabs == nil {
+		if current.url == "" {
+			// Without a page address the result cannot name the tab; keep
+			// the previous one rather than report every tab as closed.
+			current.tabs, current.activeTab = before.tabs, before.activeTab
+		} else {
+			// A snapshot-bearing result lists Open tabs whenever more than
+			// one tab is open, so a missing section means one tab.
+			current.tabs, current.activeTab = singleTab(current.url, current.title)
+		}
 	}
+
+	p.mu.Lock()
 	p.observation = current
 	if !before.hasSnapshot || before.url != current.url {
 		// A new page starts a new baseline; old downloads and references
@@ -122,12 +142,22 @@ func (p *browserPages) observeAction(name string, result json.RawMessage, output
 
 // observeTabs records the tab list of a result that carries no snapshot,
 // such as browser_tabs, so the next action does not report these tabs again.
-func (p *browserPages) observeTabs(texts []string) {
+func (p *browserPages) observeTabs(name string, texts []string) {
 	tabs, active := parseTabs(texts)
+	if tabs == nil && name == "browser_tabs" {
+		// browser_tabs prints its list in the Result section; a later page
+		// action would re-report every tab without this baseline.
+		tabs, active = parseResultTabs(texts)
+	}
 	if tabs == nil {
 		return
 	}
 	p.mu.Lock()
+	if p.observation.activeTab != active {
+		// Selecting another tab changes the page even when the address is
+		// unchanged; its tree belongs to a new baseline.
+		p.observation.hasSnapshot = false
+	}
 	p.observation.tabs, p.observation.activeTab = tabs, active
 	p.mu.Unlock()
 }
@@ -139,7 +169,9 @@ func shouldCompact(name string, diff browserObservationDiff) bool {
 	case "browser_snapshot", "browser_navigate", "browser_navigate_back", "browser_tabs":
 		return false
 	}
-	if diff.urlChanged {
+	if diff.urlChanged || diff.activeTab != "" {
+		// A tab switch changes which page the refs belong to, even when the
+		// address is the same.
 		return false
 	}
 	return len(diff.added)+len(diff.changed) <= maxDiffElements
@@ -166,8 +198,10 @@ func compareObservation(before, current browserObservation) browserObservationDi
 			diff.downloads = append(diff.downloads, address)
 		}
 	}
-	for address, line := range current.tabs {
-		old, present := before.tabs[address]
+	// Tabs are keyed by their list index so two tabs on one address stay
+	// distinct; the current marker is not part of the stored line.
+	for index, line := range current.tabs {
+		old, present := before.tabs[index]
 		switch {
 		case !present:
 			diff.tabsAdded = append(diff.tabsAdded, line)
@@ -175,8 +209,8 @@ func compareObservation(before, current browserObservation) browserObservationDi
 			diff.tabsChanged = append(diff.tabsChanged, line)
 		}
 	}
-	for address, line := range before.tabs {
-		if _, present := current.tabs[address]; !present {
+	for index, line := range before.tabs {
+		if _, present := current.tabs[index]; !present {
 			diff.tabsRemoved = append(diff.tabsRemoved, line)
 		}
 	}
@@ -192,11 +226,9 @@ func compareObservation(before, current browserObservation) browserObservationDi
 // A reference whose line changed is reported once, as changed, and excluded
 // from the added and removed line lists.
 func compareTree(before, current browserObservation, diff *browserObservationDiff) {
-	changedRefs := map[string]bool{}
 	for ref, line := range current.refs {
 		if old, present := before.refs[ref]; present && old != line {
 			diff.changed = append(diff.changed, line)
-			changedRefs[ref] = true
 		}
 	}
 	for ref, line := range current.refs {
@@ -207,17 +239,11 @@ func compareTree(before, current browserObservation, diff *browserObservationDif
 	removed := make([]string, 0)
 	for ref, line := range before.refs {
 		if _, present := current.refs[ref]; !present {
-			if changedRefs[ref] {
-				continue
-			}
 			removed = append(removed, line)
 		}
 	}
 	for line, count := range current.lines {
 		if count <= before.lines[line] {
-			continue
-		}
-		if containsRef(line, changedRefs) {
 			continue
 		}
 		if !strings.Contains(line, "[ref=") {
@@ -228,10 +254,11 @@ func compareTree(before, current browserObservation, diff *browserObservationDif
 		if count <= current.lines[line] {
 			continue
 		}
-		if match := pageRef.FindStringSubmatch(line); match != nil && changedRefs[match[2]] {
-			continue
+		// Element lines are the refs map's responsibility; lines holds only
+		// text lines, so a ref is never reported as both changed and text.
+		if !strings.Contains(line, "[ref=") {
+			removed = append(removed, line)
 		}
-		removed = append(removed, line)
 	}
 	sort.Strings(diff.added)
 	sort.Strings(diff.changed)
@@ -241,11 +268,6 @@ func compareTree(before, current browserObservation, diff *browserObservationDif
 	if len(removed) > maxRemovedSamples {
 		diff.removed, diff.removedMore = removed[:maxRemovedSamples], len(removed)-maxRemovedSamples
 	}
-}
-
-func containsRef(line string, refs map[string]bool) bool {
-	match := pageRef.FindStringSubmatch(line)
-	return match != nil && refs[match[2]]
 }
 
 func uniqueStrings(values []string) []string {
@@ -261,6 +283,11 @@ func uniqueStrings(values []string) []string {
 	return out
 }
 
+// indentOf counts the leading spaces of one snapshot line.
+func indentOf(line string) int {
+	return len(line) - len(strings.TrimLeft(line, " "))
+}
+
 // observationFromText reads the page header, tabs and full snapshot of one
 // result into a baseline.
 func observationFromText(texts, snapshots []string) browserObservation {
@@ -269,6 +296,7 @@ func observationFromText(texts, snapshots []string) browserObservation {
 		refs:        map[string]string{},
 		lines:       map[string]int{},
 		downloads:   map[string]bool{},
+		artifacts:   map[string]bool{},
 	}
 	for _, text := range texts {
 		if match := pageURL.FindStringSubmatch(text); match != nil {
@@ -286,15 +314,45 @@ func observationFromText(texts, snapshots []string) browserObservation {
 	}
 	observation.tabs, observation.activeTab = parseTabs(texts)
 	for _, snapshot := range snapshots {
-		for _, line := range strings.Split(snapshot, "\n") {
+		lines := strings.Split(snapshot, "\n")
+		skip := map[int]bool{}
+		for index, line := range lines {
+			if skip[index] {
+				continue
+			}
 			trimmed := strings.TrimSpace(line)
 			if trimmed == "" {
 				continue
 			}
 			observation.lines[trimmed]++
-			if match := pageRef.FindStringSubmatch(line); match != nil {
-				observation.refs[match[2]] = trimmed
+			match := pageRef.FindStringSubmatch(line)
+			if match == nil {
+				continue
 			}
+			value := trimmed
+			if strings.HasSuffix(trimmed, ":") {
+				parentIndent := indentOf(line)
+				for nextIndex := index + 1; nextIndex < len(lines); nextIndex++ {
+					next := lines[nextIndex]
+					nextTrimmed := strings.TrimSpace(next)
+					if nextTrimmed == "" {
+						continue
+					}
+					nextIndent := indentOf(next)
+					if nextIndent <= parentIndent {
+						break
+					}
+					if nextIndent == parentIndent+2 && strings.HasPrefix(nextTrimmed, "- /") {
+						continue
+					}
+					if nextIndent == parentIndent+2 && strings.HasPrefix(nextTrimmed, "- text: ") {
+						value = strings.TrimSuffix(trimmed, ":") + ": " + strings.TrimPrefix(nextTrimmed, "- text: ")
+						skip[nextIndex] = true
+					}
+					break
+				}
+			}
+			observation.refs[match[2]] = value
 		}
 	}
 	return observation
@@ -311,29 +369,64 @@ func parseTabs(texts []string) (map[string]string, string) {
 		if block == nil {
 			continue
 		}
-		tabs = map[string]string{}
-		for _, line := range strings.Split(strings.TrimSpace(block[1]), "\n") {
-			match := openTabLine.FindStringSubmatch(strings.TrimSpace(line))
-			if match == nil {
-				continue
-			}
-			address := match[2]
-			tabs[address] = strings.TrimSpace(line)
-			if strings.Contains(line, "(current)") {
-				active = address
-			}
-		}
+		tabs, active = parseTabLines(block[1])
 	}
 	return tabs, active
 }
 
-// singleTab is the tab list of a page whose result did not print one: the
-// current page is the only tab Playwright reported.
+// parseResultTabs reads the tab list browser_tabs prints in the Result
+// section when the call carries no snapshot.
+func parseResultTabs(texts []string) (map[string]string, string) {
+	for _, text := range texts {
+		block := resultBlock.FindStringSubmatch(text)
+		if block == nil {
+			continue
+		}
+		if tabs, active := parseTabLines(block[1]); tabs != nil {
+			return tabs, active
+		}
+	}
+	return nil, ""
+}
+
+// parseTabLines keys tabs by their list index, so two tabs on one address
+// stay distinct, and stores the line without the current marker.
+func parseTabLines(block string) (map[string]string, string) {
+	if strings.HasPrefix(strings.TrimSpace(block), "No open tabs.") {
+		return map[string]string{}, ""
+	}
+	tabs := map[string]string{}
+	var active string
+	for _, raw := range strings.Split(strings.TrimSpace(block), "\n") {
+		line := strings.TrimSpace(raw)
+		match := openTabLine.FindStringSubmatch(line)
+		if match == nil {
+			continue
+		}
+		normalized := normalizeTabLine(line)
+		tabs[match[1]] = normalized
+		if strings.Contains(line, ": (current) [") {
+			active = match[1] + ": " + match[3]
+		}
+	}
+	if len(tabs) == 0 {
+		return nil, ""
+	}
+	return tabs, active
+}
+
+func normalizeTabLine(line string) string {
+	return strings.Replace(line, ": (current) [", ": [", 1)
+}
+
+// singleTab is the only tab a snapshot-bearing result has when it prints no
+// Open tabs section.
 func singleTab(url, title string) (map[string]string, string) {
 	if url == "" {
 		return nil, ""
 	}
-	return map[string]string{url: "- 0: (current) [" + title + "](" + url + ")"}, url
+	line := "- 0: [" + title + "](" + url + ")"
+	return map[string]string{"0": line}, "0: " + url
 }
 
 // changedLine renders one value that appeared, disappeared or became other.
@@ -366,7 +459,7 @@ func (d browserObservationDiff) render() string {
 		fmt.Fprintf(&out, "- console: %s\n", d.consoleLine)
 	}
 	if d.activeTab != "" {
-		fmt.Fprintf(&out, "- active tab: %s\n", d.activeTab)
+		fmt.Fprintf(&out, "- active tab: %s\n", strings.TrimPrefix(d.activeTab, "- "))
 	}
 	for _, tab := range d.tabsAdded {
 		fmt.Fprintf(&out, "- tabs added: %s\n", tab)
@@ -415,6 +508,7 @@ func compactSnapshot(result json.RawMessage, diff browserObservationDiff) json.R
 	}
 	content, _ := reply["content"].([]any)
 	report := diff.render()
+	changed := false
 	for _, item := range content {
 		part, _ := item.(map[string]any)
 		text, ok := part["text"].(string)
@@ -422,8 +516,15 @@ func compactSnapshot(result json.RawMessage, diff browserObservationDiff) json.R
 			continue
 		}
 		part["text"] = snapshotBlock.ReplaceAllLiteralString(text, report)
+		changed = true
 	}
-	encoded, _ := json.Marshal(reply)
+	if !changed {
+		return result
+	}
+	encoded, err := json.Marshal(reply)
+	if err != nil {
+		return result
+	}
 	return encoded
 }
 
@@ -458,44 +559,122 @@ func snapshotTexts(texts []string) []string {
 	return snapshots
 }
 
-// scanDownloads lists the completed files in the Operation's browser output
-// directory. Snapshots, screenshots, and unfinished downloads are not user
-// downloads. A screenshot is identified by the link Playwright printed for it,
-// so a downloaded image with the same extension is still a download.
-func scanDownloads(output string, texts []string) []string {
-	if output == "" {
-		return nil
+// mergeArtifacts keeps every file Playwright wrote in the output directory
+// marked as an artifact across pages, so a directory scan never reports one
+// as a user download.
+func mergeArtifacts(current *browserObservation, before browserObservation) {
+	if len(before.artifacts) == 0 {
+		return
 	}
-	entries, err := os.ReadDir(output)
-	if err != nil {
-		return nil
+	if current.artifacts == nil {
+		current.artifacts = map[string]bool{}
 	}
-	screenshots := map[string]bool{}
+	for name := range before.artifacts {
+		current.artifacts[name] = true
+	}
+}
+
+// observeArtifacts records links of a result that carries no snapshot, so a
+// later directory scan does not report a screenshot or log as a download.
+func (p *browserPages) observeArtifacts(texts []string, output string) {
+	artifacts := map[string]bool{}
+	collectArtifacts(texts, output, artifacts)
+	if len(artifacts) == 0 {
+		return
+	}
+	p.mu.Lock()
+	if p.observation.artifacts == nil {
+		p.observation.artifacts = map[string]bool{}
+	}
+	for name := range artifacts {
+		p.observation.artifacts[name] = true
+	}
+	p.mu.Unlock()
+}
+
+// collectArtifacts adds every link to a file inside this Operation's output
+// directory, including screenshots and console or network logs.
+func collectArtifacts(texts []string, output string, artifacts map[string]bool) {
 	for _, text := range texts {
 		for _, match := range screenshotLink.FindAllStringSubmatch(text, -1) {
-			screenshots[path.Base(match[1])] = true
+			artifacts[path.Base(match[1])] = true
+		}
+		for _, match := range markdownLink.FindAllStringSubmatch(text, -1) {
+			if name := outputArtifact(output, match[1]); name != "" {
+				artifacts[name] = true
+			}
 		}
 	}
-	var names []string
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
+}
+
+// scanDownloads lists the files a user downloaded. The Events section names
+// completed downloads; the output directory catches files whose event arrived
+// after the action. Links to files inside this Operation's output directory
+// are Playwright artifacts, not downloads, and the console log is written
+// without a link.
+func scanDownloads(output string, texts []string, artifacts map[string]bool) []string {
+	if artifacts == nil {
+		artifacts = map[string]bool{}
+	}
+	found := map[string]bool{}
+	for _, text := range texts {
+		for _, match := range downloadEvent.FindAllStringSubmatch(text, -1) {
+			found[path.Base(filepath.ToSlash(match[1]))] = true
 		}
-		name := entry.Name()
-		lower := strings.ToLower(name)
-		switch {
-		case strings.HasSuffix(lower, ".yml"), strings.HasSuffix(lower, ".yaml"),
-			strings.HasSuffix(lower, ".crdownload"), strings.HasSuffix(lower, ".tmp"),
-			screenshots[name]:
-			continue
+	}
+	collectArtifacts(texts, output, artifacts)
+	if output != "" {
+		entries, err := os.ReadDir(output)
+		if err == nil {
+			for _, entry := range entries {
+				if entry.IsDir() {
+					continue
+				}
+				name := entry.Name()
+				lower := strings.ToLower(name)
+				switch {
+				case strings.HasSuffix(lower, ".yml"), strings.HasSuffix(lower, ".yaml"),
+					strings.HasSuffix(lower, ".crdownload"), strings.HasSuffix(lower, ".tmp"),
+					consoleLog.MatchString(lower), artifacts[name]:
+					continue
+				}
+				if info, err := entry.Info(); err == nil && info.Mode().IsRegular() {
+					found[name] = true
+				}
+			}
 		}
-		if info, err := entry.Info(); err != nil || !info.Mode().IsRegular() {
-			continue
-		}
+	}
+	if len(found) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(found))
+	for name := range found {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	return names
+}
+
+// outputArtifact returns the file name of a link that points inside this
+// Operation's output directory, or empty for a page or remote link.
+func outputArtifact(output, target string) string {
+	if output == "" || strings.Contains(target, "://") {
+		return ""
+	}
+	marker := path.Base(filepath.ToSlash(output)) + "/"
+	slash := filepath.ToSlash(target)
+	index := strings.Index(slash, marker)
+	if index < 0 {
+		return ""
+	}
+	rest := slash[index+len(marker):]
+	if hash := strings.IndexByte(rest, '#'); hash >= 0 {
+		rest = rest[:hash]
+	}
+	if rest == "" || strings.HasSuffix(rest, "/") {
+		return ""
+	}
+	return path.Base(rest)
 }
 
 func setOf(values []string) map[string]bool {
