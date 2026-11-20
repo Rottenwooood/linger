@@ -551,7 +551,7 @@ func (op *operation) requestBrowser(ctx context.Context, name string, args json.
 		output = op.userChromeSession.output
 	}
 	result = inlineSnapshot(result, op.spec.WorkingDirectory, output)
-	op.pages.observe(result)
+	result = op.pages.observeAction(name, result, output)
 	return result, nil
 }
 

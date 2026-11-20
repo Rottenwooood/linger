@@ -227,7 +227,7 @@ Before the first shell screenshot, or when one fails or comes back blank, run ` 
 ` + browserToolGuide
 
 // browserToolGuide lists the Playwright browser tools, which Codex also defers.
-const browserToolGuide = `Browser tools (MCP server "browser", when present): browser_navigate({url}), browser_snapshot() reads the page with element refs, browser_click({target}) and browser_type({target, text, submit?}) act on a ref from the latest snapshot, browser_tabs({action: "list" | "new" | "select" | "close"}). Each action returns the page snapshot after it, so call browser_snapshot only to read a page you have not changed.`
+const browserToolGuide = `Browser tools (MCP server "browser", when present): browser_navigate({url}), browser_snapshot() reads the page with element refs, browser_click({target}) and browser_type({target, text, submit?}) act on a ref from the latest snapshot, browser_tabs({action: "list" | "new" | "select" | "close"}). Each action returns the page state after it; a same-page interaction returns only what changed and keeps existing refs valid, so call browser_snapshot for the full tree or a page you have not changed.`
 
 // macCompactTool is the macOS shape of one Cua tool: the fields the Computer
 // routes, without Cua's delivery modes, scopes and capture ids.

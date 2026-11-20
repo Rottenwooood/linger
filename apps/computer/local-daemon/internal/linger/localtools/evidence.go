@@ -370,6 +370,9 @@ type browserPages struct {
 	// links are the absolute addresses, without fragment, that the current
 	// page's snapshots link to.
 	links map[string]bool
+	// observation is the baseline of the latest full snapshot on the
+	// current page, so a same-page action reports only what it changed.
+	observation browserObservation
 }
 
 // maxPageRefs bounds the remembered elements and links; past it the oldest
