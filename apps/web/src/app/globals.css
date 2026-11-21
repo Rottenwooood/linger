@@ -128,6 +128,11 @@
 
 :root[data-han-font="sc"] {
   --app-font-han: "PingFang SC", "Noto Sans SC Variable";
+  /* No Chinese slab face pairs with Roboto Slab, and Songti reads as a
+     different voice next to the sans interface, so Han text in slab headings
+     uses the same sans Han font as the rest of the interface. */
+  --app-font-slab:
+    "Roboto Slab Variable", Georgia, var(--app-font-han), sans-serif;
 }
 
 :root {
@@ -2389,8 +2394,8 @@ a[href][aria-disabled="true"],
 
 /* A small gap sets the pinned rows apart from the rest, without a divider. */
 .room-secondary-navigation-list
-  .group:has([aria-label="Pinned"])
-  + .group:not(:has([aria-label="Pinned"])) {
+  .group:has(.room-pin-badge)
+  + .group:not(:has(.room-pin-badge)) {
   margin-top: 6px;
 }
 
@@ -2757,14 +2762,9 @@ a[href][aria-disabled="true"],
   background: color-mix(in srgb, var(--app-info) 24%, transparent);
 }
 
-.message-composer-input[data-composing="true"] {
-  color: var(--app-ink);
-  -webkit-text-fill-color: var(--app-ink);
-}
-
-.message-composer-input[data-composing="true"]
-  + .message-composer-highlight-layer {
-  visibility: hidden;
+.message-composer-composition {
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 .message-composer-highlight-layer {
@@ -4385,7 +4385,7 @@ button.question-choice:focus-visible {
     margin-right: -100%;
   }
 
-  .app-room-layout .panel-sidebar [aria-label="Resize sidebar"],
+  .app-room-layout .panel-sidebar [data-panel-resize-handle],
   .panel-maximize-control {
     display: none;
   }
@@ -5568,9 +5568,8 @@ button.question-choice:focus-visible {
   font-size: 12px;
   font-weight: 500;
 }
-/* The desktop app cannot float voice windows into picture-in-picture, so they
-   always stay in the page; there the bar takes the window's own surface
-   instead of a browser-style dark frame. */
+/* A voice window inside the desktop app's page takes the window's own surface
+   for its bar instead of a browser-style dark frame. */
 :root[data-desktop-shell] .voice-window-title {
   background-color: var(--app-canvas);
   color: var(--app-ink);

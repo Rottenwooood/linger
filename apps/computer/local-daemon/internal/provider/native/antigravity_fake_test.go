@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
+	"time"
 )
 
 // The test binary doubles as a fake `agy acp` when agyFakeEnv names a mode.
@@ -125,6 +127,9 @@ func (f *agyFakeProcess) handle(id json.RawMessage, method string, params map[st
 				f.fail(id, -32603, "session could not be loaded")
 				return
 			}
+			if f.mode == "load-hang" {
+				select {}
+			}
 			// Loading replays the stored conversation before answering; an
 			// id Antigravity never stored loads with nothing to replay.
 			if f.mode != "unknown-session" {
@@ -154,7 +159,7 @@ func (f *agyFakeProcess) prompt(id json.RawMessage, sessionID string) {
 		map[string]any{"content": "List files", "status": "in_progress", "priority": "high"},
 		map[string]any{"content": "Report", "status": "pending", "priority": "low"},
 	}})
-	f.update(sessionID, map[string]any{"sessionUpdate": "tool_call", "toolCallId": "call-1", "title": "ls", "kind": "execute", "status": "pending", "rawInput": map[string]any{"command": "ls"}})
+	f.update(sessionID, map[string]any{"sessionUpdate": "tool_call", "toolCallId": "call-1", "name": "run_command", "title": "ls", "kind": "execute", "status": "pending", "rawInput": map[string]any{"CommandLine": "ls", "WaitMsBeforeAsync": 5000}})
 	if f.mode == "permission" || f.mode == "permission-no-reject" {
 		command := os.Getenv(agyFakeCommandEnv)
 		if command == "" {
@@ -166,7 +171,7 @@ func (f *agyFakeProcess) prompt(id json.RawMessage, sessionID string) {
 		}
 		f.send(map[string]any{"jsonrpc": "2.0", "id": 900, "method": "session/request_permission", "params": map[string]any{
 			"sessionId": sessionID,
-			"toolCall":  map[string]any{"toolCallId": "call-1", "title": command, "kind": "execute", "rawInput": map[string]any{"command": command}},
+			"toolCall":  map[string]any{"toolCallId": "call-1", "title": command, "kind": "execute", "rawInput": map[string]any{"CommandLine": command}},
 			"options":   options,
 		}})
 		<-f.answers
@@ -174,10 +179,33 @@ func (f *agyFakeProcess) prompt(id json.RawMessage, sessionID string) {
 	if f.mode == "hang" {
 		select {}
 	}
+	if strings.HasPrefix(f.mode, "background") {
+		// Antigravity ends the turn while the command runs in the background
+		// and continues on its own once it finishes.
+		f.update(sessionID, map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": "Running in the background."}})
+		f.result(id, map[string]any{"stopReason": "end_turn"})
+		time.Sleep(50 * time.Millisecond)
+		switch f.mode {
+		case "background-exit":
+			os.Exit(0)
+		case "background-stuck":
+			select {}
+		}
+	}
 	f.update(sessionID, map[string]any{"sessionUpdate": "tool_call_update", "toolCallId": "call-1", "status": "completed", "content": []any{
 		map[string]any{"type": "content", "content": map[string]any{"type": "text", "text": "a.txt"}},
 	}})
-	f.update(sessionID, map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": "Found "}})
+	found := "Found "
+	if f.mode == "background" {
+		// Antigravity opens a continuation's text with a blank line.
+		found = "\n\nFound "
+	}
+	f.update(sessionID, map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": found}})
 	f.update(sessionID, map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": "a.txt"}})
+	if f.mode == "background" {
+		// A turn may end on a tool call; the reply stays the last message.
+		f.update(sessionID, map[string]any{"sessionUpdate": "tool_call", "toolCallId": "call-2", "name": "run_command", "title": "true", "kind": "execute", "status": "completed", "rawInput": map[string]any{"CommandLine": "true"}})
+		return
+	}
 	f.result(id, map[string]any{"stopReason": "end_turn", "usage": map[string]any{"inputTokens": 10, "outputTokens": 4, "thoughtTokens": 2, "cachedReadTokens": 3}})
 }

@@ -10,7 +10,10 @@ import { useParams, useSearchParams } from "react-router";
 
 import { Button } from "@/components/ui/button";
 import { requireRoomRouteParam } from "@/features/rooms/room-route-params";
+import { TeamHubError } from "@/features/teamhub/teamhub-error";
 import { useTeamHubRuntime } from "@/features/teamhub/teamhub-runtime";
+import type { Translate } from "@/i18n/language";
+import { useT } from "@/i18n/use-translation";
 
 import {
   filterWikiGraph,
@@ -21,8 +24,10 @@ import { WikiRefreshBanner } from "@/features/wiki/wiki-refresh-status";
 import { useAnotherMeActorId } from "@/features/wiki/wiki-working-card";
 import { nodeMoments, parseEmbeddedWikiGraph } from "./wiki-graph-model";
 import { WikiBack } from "@/features/wiki/wiki-home-page";
+import { wikiMessages } from "@/features/wiki/wiki.messages";
 import { WikiKnowledgeGraph } from "./wiki-knowledge-graph";
 import { usePeriodReports } from "./wiki-period-reports";
+import { wikiTimelineMessages as m } from "./wiki-timeline.messages";
 
 const DailyPanel = lazy(async () => {
   const { WikiGraphDailyPanel } = await import("./wiki-graph-daily-panel");
@@ -34,7 +39,17 @@ const ReportCards = lazy(async () => {
   return { default: WikiGraphReportCards };
 });
 
+// TeamHub names this state with a code, so it can be worded in the language
+// on screen; any other error keeps the words it arrived with.
+function graphErrorText(error: Error, t: Translate) {
+  if (error instanceof TeamHubError && error.code === "GRAPH_UNAVAILABLE") {
+    return t(m.graphUnavailable);
+  }
+  return error.message || t(m.unavailable);
+}
+
 export function WikiGraphPage() {
+  const t = useT();
   const { client } = useTeamHubRuntime();
   const tenantId = requireRoomRouteParam(useParams().tenantId, "Tenant");
   const [searchParams] = useSearchParams();
@@ -77,11 +92,11 @@ export function WikiGraphPage() {
     <main className="wiki-graph-page flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-app-surface">
       <header className="wiki-graph-page-header px-4 pt-4 pb-6">
         <WikiBack />
-        <h1 className="mb-2 text-2xl text-foreground">Daily report</h1>
+        <h1 className="mb-2 text-2xl text-foreground">{t(m.dailyReport)}</h1>
         <p className="text-sm text-muted-foreground">
           {reports.isPending
-            ? "Loading reports…"
-            : `${reports.data?.length ?? 0} reports · Browse by day`}
+            ? t(wikiMessages.loadingReports)
+            : t(m.reportCount, { count: reports.data?.length ?? 0 })}
         </p>
       </header>
 
@@ -102,13 +117,13 @@ export function WikiGraphPage() {
               className={refresh.initializing ? "town-shimmer-text" : undefined}
             >
               {refresh.initializing
-                ? "Wiki is being generated…"
-                : "Loading timeline…"}
+                ? t(m.generating)
+                : t(wikiMessages.loadingTimeline)}
             </span>
           </div>
         ) : graph.error ? (
           <div
-            aria-label={graph.error.message || "Timeline is unavailable."}
+            aria-label={graphErrorText(graph.error, t)}
             className="flex h-full min-h-[480px] flex-col items-center justify-center text-center"
             role="alert"
           >
@@ -118,7 +133,7 @@ export function WikiGraphPage() {
               size={24}
             />
             <p className="text-sm text-app-danger">
-              {graph.error.message || "Timeline is unavailable."}
+              {graphErrorText(graph.error, t)}
             </p>
             <Button
               className="mt-3"
@@ -126,7 +141,7 @@ export function WikiGraphPage() {
               size="compact"
               tone="secondary"
             >
-              <Icon icon={RefreshIcon} size={14} /> Retry graph
+              <Icon icon={RefreshIcon} size={14} /> {t(m.retryGraph)}
             </Button>
           </div>
         ) : filteredGraph ? (
@@ -139,7 +154,7 @@ export function WikiGraphPage() {
               <Suspense
                 fallback={
                   <p role="status" className="p-6 text-sm text-app-muted">
-                    Loading timeline…
+                    {t(wikiMessages.loadingTimeline)}
                   </p>
                 }
               >
@@ -161,7 +176,11 @@ export function WikiGraphPage() {
                 <Suspense
                   fallback={
                     <div role="status" className="wiki-graph-daily-panel p-4">
-                      Loading Daily…
+                      {t(
+                        selectedReport.kind === "daily"
+                          ? m.loadingDaily
+                          : m.loadingWeekly,
+                      )}
                     </div>
                   }
                 >
@@ -178,8 +197,7 @@ export function WikiGraphPage() {
           />
         ) : Object.values(display.decisions).includes("delete") ? (
           <p role="alert" className="p-4 text-sm text-app-muted">
-            This graph cannot display your hidden-file preferences. Refresh the
-            graph to load the current view.
+            {t(m.hiddenPreferences)}
           </p>
         ) : (
           <iframe
@@ -187,7 +205,7 @@ export function WikiGraphPage() {
             key={tenantId}
             sandbox="allow-scripts"
             srcDoc={graph.data}
-            title="Personal knowledge graph"
+            title={t(m.graphFrame)}
           />
         )}
       </section>

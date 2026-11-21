@@ -133,6 +133,19 @@ func isManagedGatewayProfilePath(stateDir, candidate string) bool {
 	return false
 }
 
+// runtimeProfileKeys names the environment variable that selects each
+// Runtime's profile directory.
+var runtimeProfileKeys = map[string]string{"codex": "CODEX_HOME", "claude": "CLAUDE_CONFIG_DIR", "pi": "PI_CODING_AGENT_DIR"}
+
+// GatewayRuntime reports whether a Runtime with this effective environment
+// reaches its model through the localmodels gateway, serving local models or a
+// BYOK endpoint, rather than its own provider: its profile is one localmodels
+// manages. Such models have no provider-hosted web search.
+func GatewayRuntime(environment map[string]string, stateDir, runtimeType string) bool {
+	key, ok := runtimeProfileKeys[runtimeType]
+	return ok && isManagedGatewayProfilePath(stateDir, environment[key])
+}
+
 // OverlayEnvironment computes the effective Runtime discovery/execution
 // environment by applying stateDir/model-source.json over base without
 // restarting the Daemon.
@@ -278,8 +291,13 @@ func NewModelSource(options ModelSourceOptions) *ModelSource {
 	}
 }
 
+// byokStdinPayload sends path and endpoint even when empty: an empty one
+// appends nothing, which localmodels tells apart from a missing field.
 type byokStdinPayload struct {
 	BaseURL       string  `json:"baseUrl"`
+	Path          string  `json:"path"`
+	Endpoint      string  `json:"endpoint"`
+	Protocol      string  `json:"protocol"`
 	APIKey        string  `json:"apiKey,omitempty"`
 	ModelID       string  `json:"modelId"`
 	ContextWindow *uint64 `json:"contextWindow,omitempty"`
@@ -292,6 +310,9 @@ func encodeByokStdin(input *wire.ByokConfigInput) ([]byte, error) {
 	}
 	return json.Marshal(byokStdinPayload{
 		BaseURL:       input.BaseURL,
+		Path:          input.Path,
+		Endpoint:      input.Endpoint,
+		Protocol:      input.Protocol,
 		APIKey:        input.APIKey,
 		ModelID:       input.ModelID,
 		ContextWindow: input.ContextWindow,
@@ -344,29 +365,22 @@ func (m *ModelSource) Status(ctx context.Context) (wire.ModelSourceStatus, error
 	return parseSourceStatus(stdout)
 }
 
-// TestByok probes a BYOK upstream endpoint for runtime, finding the wire
-// format and address it answers, without persisting credentials or mutating
-// the active model source.
-func (m *ModelSource) TestByok(ctx context.Context, runtime string, input wire.ByokConfigInput) (wire.ByokTestResult, error) {
-	if !slices.Contains([]string{"claude", "codex", "pi"}, runtime) {
-		return wire.ByokTestResult{}, &ModelSourceError{
-			Code:    "MODEL_SOURCE_INVALID",
-			Message: "Unsupported AI runtime.",
-		}
-	}
+// TestByok sends one request to the BYOK endpoint's address in its wire
+// format, without persisting credentials or mutating the active model source.
+func (m *ModelSource) TestByok(ctx context.Context, input wire.ByokConfigInput) (wire.ByokTestResult, error) {
 	var doc struct {
 		Protocol      string `json:"protocol"`
-		BaseURL       string `json:"base_url"`
+		URL           string `json:"url"`
 		ModelID       string `json:"model_id"`
 		ContextWindow uint64 `json:"context_window"`
 	}
-	if err := m.runEndpointCommand(ctx, input, modelSourceCheckSchema, &doc, "check", "--runtime", runtime); err != nil {
+	if err := m.runEndpointCommand(ctx, input, modelSourceCheckSchema, &doc, "check"); err != nil {
 		return wire.ByokTestResult{}, err
 	}
 	return wire.ByokTestResult{
 		Ok:            true,
 		Protocol:      doc.Protocol,
-		BaseURL:       doc.BaseURL,
+		URL:           doc.URL,
 		ModelID:       doc.ModelID,
 		ContextWindow: doc.ContextWindow,
 	}, nil

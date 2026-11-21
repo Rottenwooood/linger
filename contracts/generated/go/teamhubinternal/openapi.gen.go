@@ -1321,16 +1321,22 @@ func (e RuntimeHumanInteractionCreatedStatus) Valid() bool {
 
 // Defines values for RuntimePermissionActionRuntime.
 const (
-	RuntimePermissionActionRuntimeClaude RuntimePermissionActionRuntime = "claude"
-	RuntimePermissionActionRuntimeCodex  RuntimePermissionActionRuntime = "codex"
+	RuntimePermissionActionRuntimeAntigravity RuntimePermissionActionRuntime = "antigravity"
+	RuntimePermissionActionRuntimeClaude      RuntimePermissionActionRuntime = "claude"
+	RuntimePermissionActionRuntimeCodex       RuntimePermissionActionRuntime = "codex"
+	RuntimePermissionActionRuntimePi          RuntimePermissionActionRuntime = "pi"
 )
 
 // Valid indicates whether the value is a known member of the RuntimePermissionActionRuntime enum.
 func (e RuntimePermissionActionRuntime) Valid() bool {
 	switch e {
+	case RuntimePermissionActionRuntimeAntigravity:
+		return true
 	case RuntimePermissionActionRuntimeClaude:
 		return true
 	case RuntimePermissionActionRuntimeCodex:
+		return true
+	case RuntimePermissionActionRuntimePi:
 		return true
 	default:
 		return false
@@ -2213,6 +2219,12 @@ type AgentLocalRun struct {
 
 // AgentLocalRunStatus defines model for AgentLocalRun.Status.
 type AgentLocalRunStatus string
+
+// AgentLocalRunReplyStatus defines model for AgentLocalRunReplyStatus.
+type AgentLocalRunReplyStatus struct {
+	// Replied Whether TeamHub persisted a visible reply from this Local Run: a conversation Message or decision card attributed to the Run, a queued presentation sequence attributed to the Run, or an unattributed conversation Message, presentation sequence, or emoji Reaction written by the Context's Agent in the Room or its Threads since the Run started.
+	Replied bool `json:"replied"`
+}
 
 // AgentMemoryDocument defines model for AgentMemoryDocument.
 type AgentMemoryDocument struct {
@@ -4613,6 +4625,12 @@ type GetAgentRuntimeLocalComputerParams struct {
 
 // GetAgentLocalRunParams defines parameters for GetAgentLocalRun.
 type GetAgentLocalRunParams struct {
+	ContextKey ContextKey `form:"context_key" json:"context_key"`
+	LocalRunId LocalRunId `form:"local_run_id" json:"local_run_id"`
+}
+
+// GetAgentLocalRunReplyStatusParams defines parameters for GetAgentLocalRunReplyStatus.
+type GetAgentLocalRunReplyStatusParams struct {
 	ContextKey ContextKey `form:"context_key" json:"context_key"`
 	LocalRunId LocalRunId `form:"local_run_id" json:"local_run_id"`
 }

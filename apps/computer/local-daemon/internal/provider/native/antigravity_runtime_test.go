@@ -2,6 +2,7 @@ package native
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -112,7 +113,7 @@ func TestAntigravityRunsOneTurnOverACP(t *testing.T) {
 	if !reflect.DeepEqual(kinds, want) {
 		t.Fatalf("kinds=%v", kinds)
 	}
-	if call.ActivityKind != ActivityCommand || call.InvocationID != result.InvocationID || call.Input["command"] != "ls" || result.Output != "a.txt" || result.Status != "completed" {
+	if call.ToolName != "run_command" || call.ActivityKind != ActivityCommand || call.InvocationID != result.InvocationID || call.Input["command"] != "ls" || result.Output != "a.txt" || result.Status != "completed" {
 		t.Fatalf("call=%+v result=%+v", call, result)
 	}
 	if events[1].ID == events[5].ID || events[5].ID != events[6].ID {
@@ -237,8 +238,8 @@ func TestAntigravityReportsAnUnknownRetainedSessionAsNotFound(t *testing.T) {
 			if outcome.Status != statusFailed || outcome.FailureCode != "session_not_found" || !outcome.ResumeRefused || outcome.SessionID != "" {
 				t.Fatalf("outcome=%+v", outcome)
 			}
-			// Nothing reached the Room, so the executor may start afresh.
-			if len(events) != 0 {
+			// The Run started on the retained session before agy refused it.
+			if len(events) != 1 || events[0].Kind != EventStatus || events[0].SessionID != "moved-session" {
 				t.Fatalf("events=%+v", events)
 			}
 			if requests := h.requests(t); len(requests["session/prompt"]) != 0 {
@@ -355,5 +356,124 @@ func TestAntigravityReportsTheSessionItStartsAsTheTurnCheckpoint(t *testing.T) {
 	}
 	if _, err := h.runtime.Start(t.Context(), "first", RunSpec{Dir: h.dir, AssignSessionID: "assigned"}); err == nil {
 		t.Fatal("Start accepted an assigned session id")
+	}
+}
+
+func TestAntigravityRunCommandMapsToSharedCommandShape(t *testing.T) {
+	input := antigravityInput(json.RawMessage(`{"CommandLine":"teamhub message send --content hi","WaitMsBeforeAsync":5000}`))
+	if input["command"] != "teamhub message send --content hi" {
+		t.Fatalf("input = %#v", input)
+	}
+	review := antigravityReview(acpUpdate{Kind: "execute", RawInput: json.RawMessage(`{"CommandLine":"rm -rf build"}`)}, t.TempDir())
+	if review.Action.Command != "rm -rf build" || review.Action.Tool != "Bash" {
+		t.Fatalf("review = %#v", review.Action)
+	}
+	for _, test := range []struct {
+		status, output, want string
+	}{
+		{"completed", `{"output":"","exit_code":1}`, "failed"},
+		{"completed", `{"output":"","exit_code":0}`, "completed"},
+		{"completed", ``, "completed"},
+		{"failed", `{"exit_code":0}`, "failed"},
+	} {
+		if got := antigravityToolStatus(acpUpdate{Status: test.status, RawOutput: json.RawMessage(test.output)}); got != test.want {
+			t.Fatalf("status %s with %s = %s, want %s", test.status, test.output, got, test.want)
+		}
+	}
+}
+
+func TestAntigravityStartsAResumedRunBeforeTheSessionLoads(t *testing.T) {
+	h := newAgyHarness(t, "load-hang", nil)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	run, err := h.runtime.Start(ctx, "again", RunSpec{Dir: h.dir, ResumeID: "earlier-session", ExposeTurnStarted: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case started := <-run.Events:
+		if started.Kind != EventStatus || started.TurnID == "" || started.SessionID != "earlier-session" {
+			t.Fatalf("first event=%+v", started)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the Run did not start while its session was loading")
+	}
+	cancel()
+	drainAgy(t, run)
+}
+
+func TestAntigravityContinuesAnEarlyStartedRunInANewSession(t *testing.T) {
+	h := newAgyHarness(t, "unknown-session", nil)
+	moved := 0
+	run, err := h.runtime.Start(t.Context(), "again", RunSpec{Dir: h.dir, ResumeID: "moved-session", ExposeTurnStarted: true, FreshSession: func() { moved++ }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, outcome := drainAgy(t, run)
+	if outcome.Status != statusCompleted || outcome.SessionID != "fake-session" {
+		t.Fatalf("outcome=%+v", outcome)
+	}
+	var starts []Event
+	for _, event := range events {
+		if event.Kind == EventStatus && event.TurnID != "" {
+			starts = append(starts, event)
+		}
+	}
+	if len(starts) != 1 || starts[0].SessionID != "moved-session" || moved != 1 {
+		t.Fatalf("turn-started events=%+v, moved %d times", starts, moved)
+	}
+	if requests := h.requests(t); len(requests["session/new"]) != 1 || len(requests["session/prompt"]) != 1 {
+		t.Fatalf("requests=%v", requests)
+	}
+}
+
+func TestAntigravityWaitsForACommandItMovedToTheBackground(t *testing.T) {
+	quiet := antigravityQuietWindow
+	antigravityQuietWindow = 300 * time.Millisecond
+	t.Cleanup(func() { antigravityQuietWindow = quiet })
+	h := newAgyHarness(t, "background", nil)
+	run, err := h.runtime.Start(t.Context(), "list files", RunSpec{Dir: h.dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, outcome := drainAgy(t, run)
+	if outcome.Status != statusCompleted || outcome.Output != "\n\nFound a.txt" {
+		t.Fatalf("outcome=%+v", outcome)
+	}
+	var result Event
+	for _, event := range events {
+		if event.Kind == EventToolOutput && event.InvocationID == antigravityInvocationID("call-1") {
+			result = event
+		}
+	}
+	if result.Output != "a.txt" || result.Status != "completed" {
+		t.Fatalf("the background command's result was lost: %+v", result)
+	}
+}
+
+func TestAntigravityEndsTheBackgroundWaitWhenAgyExits(t *testing.T) {
+	h := newAgyHarness(t, "background-exit", nil)
+	run, err := h.runtime.Start(t.Context(), "list files", RunSpec{Dir: h.dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, outcome := drainAgy(t, run)
+	if outcome.Status != statusFailed || outcome.Error != "Antigravity exited before the turn finished" {
+		t.Fatalf("outcome=%+v", outcome)
+	}
+}
+
+func TestAntigravityBoundsTheBackgroundWait(t *testing.T) {
+	limit := antigravityBackgroundLimit
+	antigravityBackgroundLimit = 300 * time.Millisecond
+	t.Cleanup(func() { antigravityBackgroundLimit = limit })
+	h := newAgyHarness(t, "background-stuck", nil)
+	run, err := h.runtime.Start(t.Context(), "list files", RunSpec{Dir: h.dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, outcome := drainAgy(t, run)
+	if outcome.Status != statusCompleted || outcome.Output != "Running in the background." {
+		t.Fatalf("outcome=%+v", outcome)
 	}
 }

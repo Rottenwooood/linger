@@ -17,7 +17,7 @@ import (
 // model source (local models, native subscriptions, or BYOK on Bifrost).
 type ModelSourceManager interface {
 	Status(ctx context.Context) (wire.ModelSourceStatus, error)
-	TestByok(ctx context.Context, runtime string, input wire.ByokConfigInput) (wire.ByokTestResult, error)
+	TestByok(ctx context.Context, input wire.ByokConfigInput) (wire.ByokTestResult, error)
 	ListByokModels(ctx context.Context, input wire.ByokConfigInput) (wire.ByokModelList, error)
 	Apply(ctx context.Context, apply localmodels.ModelSourceApply) (wire.ModelSourceStatus, error)
 }
@@ -95,18 +95,18 @@ func (d *Daemon) handleModelSourceCommand(ctx context.Context, stream transport.
 			status = &res
 		}
 	case "test":
-		if request.Byok == nil || request.Runtime == "" {
-			return sendFailed("BYOK_INVALID_CONFIG", "A BYOK endpoint and its AI runtime are required.", false)
+		if request.Byok == nil || !validByokProtocol(request.Byok.Protocol) {
+			return sendFailed("BYOK_INVALID_CONFIG", "A BYOK endpoint with a supported wire format is required.", false)
 		}
-		res, err := d.modelSource.TestByok(commandCtx, request.Runtime, *request.Byok)
+		res, err := d.modelSource.TestByok(commandCtx, *request.Byok)
 		if err != nil {
 			actionErr = err
 		} else {
 			testResult = &res
 		}
 	case "models":
-		if request.Byok == nil {
-			return sendFailed("BYOK_INVALID_CONFIG", "A BYOK endpoint is required.", false)
+		if request.Byok == nil || !validByokProtocol(request.Byok.Protocol) {
+			return sendFailed("BYOK_INVALID_CONFIG", "A BYOK endpoint with a supported wire format is required.", false)
 		}
 		res, err := d.modelSource.ListByokModels(commandCtx, *request.Byok)
 		if err != nil {
@@ -117,6 +117,9 @@ func (d *Daemon) handleModelSourceCommand(ctx context.Context, stream transport.
 	case "apply":
 		if request.Mode == "" {
 			return sendFailed("MODEL_SOURCE_INVALID", "Target model source mode is required.", false)
+		}
+		if request.Byok != nil && !validByokProtocol(request.Byok.Protocol) {
+			return sendFailed("BYOK_INVALID_CONFIG", "A BYOK endpoint with a supported wire format is required.", false)
 		}
 		res, err := d.modelSource.Apply(commandCtx, localmodels.ModelSourceApply{
 			Mode:         request.Mode,
@@ -142,6 +145,10 @@ func (d *Daemon) handleModelSourceCommand(ctx context.Context, stream transport.
 		return sendFailed(localmodels.CodeToolFailed, "Could not complete the model source action on this Computer.", true)
 	}
 
+	if status != nil && !d.byokEndpoint.Load() {
+		// An Agent Service that predates BYOK paths rejects the unknown keys.
+		status.Byok.Path, status.Byok.Endpoint = "", ""
+	}
 	frame := wire.CapabilityModelSourceSucceeded{
 		ProtocolVersion: request.ProtocolVersion,
 		CommandID:       request.CommandID,
@@ -173,4 +180,13 @@ func (d *Daemon) handleModelSourceCommand(ctx context.Context, stream transport.
 		SentAt:          time.Now().UTC(),
 		Payload:         payload,
 	})
+}
+
+func validByokProtocol(protocol string) bool {
+	switch protocol {
+	case "openai-chat", "openai-responses", "anthropic":
+		return true
+	default:
+		return false
+	}
 }

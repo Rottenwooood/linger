@@ -1,6 +1,6 @@
 /* oxlint-disable react-doctor/only-export-components -- Route factories and route surfaces share one app-owned interface. */
 import type { QueryClient } from "@tanstack/react-query";
-import { lazy, Suspense, useEffect } from "react";
+import { Suspense, useEffect } from "react";
 import {
   redirect,
   type RouteObject,
@@ -34,14 +34,22 @@ import {
 } from "@/features/rooms/room-queries";
 import { requireRoomRouteParam } from "@/features/rooms/room-route-params";
 import { RoomShell } from "@/features/rooms/room-shell";
-import { RoomSurface } from "@/features/rooms/room-surface";
+import {
+  LazyRoomChat,
+  preloadRoomChat,
+  RoomSurface,
+} from "@/features/rooms/room-surface";
 import { routeLayoutKey } from "@/features/rooms/route-layout-key";
 import { RoomChatLoading } from "@/features/rooms/route-loading-surface";
+import { shellExtrasMessages } from "@/features/rooms/shell-extras.messages";
 import {
   TeamHubError,
   type TeamHubClient,
 } from "@/features/teamhub/teamhub-client";
 import type { TeamHubRuntime } from "@/features/teamhub/teamhub-runtime";
+import { commonMessages } from "@/i18n/common.messages";
+import { translate } from "@/i18n/language";
+import { useT } from "@/i18n/use-translation";
 import {
   tenantWorkItemTargetQueryOptions,
   tenantWorkItemsDashboardQueryOptions,
@@ -51,6 +59,7 @@ import {
   FullPageRouteErrorSurface,
   PanelRouteErrorSurface,
 } from "./route-error-surfaces";
+import { routePagesMessages } from "./route-pages.messages";
 
 export function createAppRoutes(
   queryClient: QueryClient,
@@ -66,22 +75,46 @@ export function createAppRoutes(
       HydrateFallback: InitialAppLoading,
       loader: withAuthenticationDeadline(async ({ request }) => {
         try {
-          await queryClient.ensureQueryData(teamHubSessionQueryOptions(client));
-          const tenants = await queryClient.ensureQueryData(
-            teamHubTenantsQueryOptions(client),
-          );
-          const tenant = tenants.items[0];
+          const [sessionResult, tenantsResult] = await Promise.allSettled([
+            queryClient.fetchQuery(teamHubSessionQueryOptions(client)),
+            queryClient.fetchQuery(teamHubTenantsQueryOptions(client)),
+          ]);
 
-          if (!tenant) {
-            throw new Error("This Account has no Space.");
+          // Inspect session before tenants so a 401 always redirects to /login
+          // even when a parallel tenants request failed first with a 5xx/network error.
+          if (sessionResult.status === "rejected") throw sessionResult.reason;
+          if (tenantsResult.status === "rejected") throw tenantsResult.reason;
+
+          const session = sessionResult.value;
+          const tenants = tenantsResult.value;
+          const targetTenant = tenants.items[0];
+
+          if (!targetTenant) {
+            throw new Error(translate(shellExtrasMessages.noSpace));
           }
 
-          const roomId = await landingRoomId(queryClient, client, tenant.id);
+          if (!request.signal.aborted) {
+            queryClient.setQueryData(
+              teamHubIdentityQueryOptions(client).queryKey,
+              session.identity,
+            );
+            queryClient.setQueryData(
+              teamHubTenantQueryOptions(client, targetTenant.id).queryKey,
+              targetTenant,
+            );
+          }
+
+          void preloadRoomChat();
+          const roomId = await landingRoomId(
+            queryClient,
+            client,
+            targetTenant.id,
+          );
 
           throw redirect(
             roomId
-              ? `/t/${tenant.id}/rooms/${roomId}/chat`
-              : `/t/${tenant.id}/rooms`,
+              ? `/t/${targetTenant.id}/rooms/${roomId}/chat`
+              : `/t/${targetTenant.id}/rooms`,
           );
         } catch (error) {
           request.signal.throwIfAborted();
@@ -169,6 +202,7 @@ export function createAppRoutes(
           ErrorBoundary: PanelRouteErrorSurface,
           loader: withAuthenticationDeadline(async ({ params, request }) => {
             const tenantId = requireRoomRouteParam(params.tenantId, "Tenant");
+            void preloadRoomChat();
             const roomId = await landingRoomId(queryClient, client, tenantId);
 
             if (roomId) {
@@ -188,6 +222,7 @@ export function createAppRoutes(
           loader: ({ params }) => {
             const tenantId = requireRoomRouteParam(params.tenantId, "Tenant");
             const roomId = requireRoomRouteParam(params.roomId, "Room");
+            void preloadRoomChat();
             // Direct-room composers need this directory. Start it alongside
             // the authoritative Room requests without making it a route gate.
             void queryClient.prefetchQuery(
@@ -384,10 +419,6 @@ async function loadMeetingPage() {
   const { MeetingPage } = await import("@/features/memory/meeting-page");
   return { Component: MeetingPage };
 }
-
-const LazyRoomChat = lazy(async () => ({
-  default: (await import("@/features/rooms/chat/room-chat")).RoomChat,
-}));
 
 interface RoomBootstrapData {
   initialRoomSeq: number;
@@ -730,6 +761,14 @@ function createSettingsRoute(): RouteObject {
         }),
         path: "models",
       },
+      {
+        lazy: async () => ({
+          Component: (
+            await import("@/features/settings/language-settings-page")
+          ).LanguageSettingsPage,
+        }),
+        path: "language",
+      },
       { loader: openModels, path: "local-models" },
       { loader: openProfile, path: "administration" },
     ],
@@ -745,14 +784,15 @@ function createSettingsRoute(): RouteObject {
 }
 
 export function InitialAppLoading() {
+  const t = useT();
   return (
     <main
       aria-busy="true"
-      aria-label="Loading TeamHub"
+      aria-label={t(commonMessages.loadingApp)}
       className="flex min-h-dvh items-center justify-center gap-2 bg-app-canvas text-sm text-app-muted"
     >
       <Spinner />
-      Loading Room...
+      {t(commonMessages.loadingRoom)}
     </main>
   );
 }
@@ -769,6 +809,7 @@ function redirectAuthenticationError(
 }
 
 function NotFoundRoute({ inShell = false }: { inShell?: boolean }) {
+  const t = useT();
   const navigate = useNavigate();
   const { tenantId } = useParams();
 
@@ -776,13 +817,13 @@ function NotFoundRoute({ inShell = false }: { inShell?: boolean }) {
     <main
       className={`flex flex-col items-center justify-center gap-4 bg-app-canvas px-8 text-center text-app-ink ${inShell ? "h-full min-h-0 flex-1" : "min-h-dvh"}`}
     >
-      <h1 className="text-lg">Page not found</h1>
+      <h1 className="text-lg">{t(routePagesMessages.notFoundTitle)}</h1>
       <Button
         onClick={() => {
           void navigate(tenantId ? `/t/${tenantId}/rooms` : "/");
         }}
       >
-        Open Messages
+        {t(routePagesMessages.openMessages)}
       </Button>
     </main>
   );

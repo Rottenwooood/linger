@@ -1,16 +1,8 @@
-import { RefreshIcon } from "@hugeicons/core-free-icons";
-import {
-  keepPreviousData,
-  useMutation,
-  useQuery,
-  useQueryClient,
-} from "@tanstack/react-query";
-import { type FormEvent, useId, useState } from "react";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
-import { Field, fieldControlClassName } from "@/components/ui/field";
 import { FormFeedback } from "@/components/ui/form-feedback";
-import { Icon } from "@/components/ui/icon";
 import { ModalDialog } from "@/components/ui/modal-dialog";
 import { Select, SelectItem } from "@/components/ui/select";
 import { Hint } from "@/features/local-computer/computer-hint";
@@ -21,53 +13,47 @@ import {
 } from "@/features/rooms/room-queries";
 import { TeamHubError } from "@/features/teamhub/teamhub-error";
 import { useTeamHubRuntime } from "@/features/teamhub/teamhub-runtime";
+import { commonMessages } from "@/i18n/common.messages";
+import type { Translate } from "@/i18n/language";
+import { RichMessage, useT } from "@/i18n/use-translation";
 import { cn } from "@/lib/cn";
 
 import {
-  byokProtocolLabels,
   modelSourceErrorCopy,
   modelSourceModeLabels,
   modelSourceRuntimeLabels,
 } from "./local-models-copy";
+import { localModelsMessages as m } from "./local-models.messages";
 import {
   type LocalModel,
   tenantLocalModelsQueryKey,
 } from "./local-models-queries";
-import { contextLabel, formatGigabytes } from "./local-models-rules";
+import { formatGigabytes, joinList } from "./local-models-rules";
 import {
-  type ByokInput,
-  type ByokModel,
-  type ByokTestRequest,
-  byokModelsQueryOptions,
   type ModelSourceMode,
-  type ModelSourceRuntime,
   type ModelSourceStatus,
   type ModelSourceSwitchRequest,
   type ModelSourceView,
   modelSourceQueryKey,
   switchModelSource,
-  testByokEndpoint,
 } from "./model-source-queries";
 
 // Subscription is not offered: switching to it moves every Agent on the
 // Computer to one Runtime without checking that Runtime is signed in, and
 // unloads local models.
 const modes: readonly ModelSourceMode[] = ["local", "byok"];
-const byokRuntimes: readonly ModelSourceRuntime[] = ["claude", "codex", "pi"];
-
-const byokExplanation =
-  "Bring your own key: use your own OpenAI-compatible or Anthropic API endpoint. A gateway on this computer serves it to your Agents.";
 
 /** What the page says the Computer's Agents run on now. */
-export function activeSourceLabel(status: ModelSourceStatus) {
+export function activeSourceLabel(status: ModelSourceStatus, t: Translate) {
   const runtime = modelSourceRuntimeLabels[status.runtime];
   if (status.mode === "byok")
-    return `BYOK · ${status.byok.model_id ?? runtime}`;
-  if (status.mode === "subscription") return `Subscription · ${runtime}`;
-  return "Local model";
+    return t(m.sourceByok, { model: status.byok.model_id ?? runtime });
+  if (status.mode === "subscription")
+    return t(m.sourceSubscription, { runtime });
+  return t(m.modeLocal);
 }
 
-interface ModelSourceSwitcher {
+export interface ModelSourceSwitcher {
   clearFeedback: () => void;
   failure: string | undefined;
   pending: ModelSourceSwitchRequest | undefined;
@@ -90,13 +76,15 @@ export function useModelSourceSwitch({
   computerName: string;
   tenantId: string;
 }) {
+  const t = useT();
   const { client } = useTeamHubRuntime();
   const queryClient = useQueryClient();
   const [busy, setBusy] = useState<{
     agents: string[];
     body: ModelSourceSwitchRequest;
   } | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  // The answer to the last switch, kept so its notice follows the language.
+  const [switched, setSwitched] = useState<ModelSourceView | null>(null);
   const [saveRevision, setSaveRevision] = useState(0);
   const mutation = useMutation({
     mutationFn: (body: ModelSourceSwitchRequest) =>
@@ -116,10 +104,10 @@ export function useModelSourceSwitch({
           body,
         });
     },
-    onMutate: () => setNotice(null),
+    onMutate: () => setSwitched(null),
     onSuccess: (view) => {
       queryClient.setQueryData(modelSourceQueryKey(tenantId, computerId), view);
-      setNotice(switchedNotice(view));
+      setSwitched(view);
       setSaveRevision((current) => current + 1);
       void Promise.all([
         queryClient.invalidateQueries({
@@ -141,12 +129,12 @@ export function useModelSourceSwitch({
     mutation.error instanceof TeamHubError ? mutation.error.code : undefined;
   const switcher: ModelSourceSwitcher = {
     clearFeedback: () => {
-      setNotice(null);
+      setSwitched(null);
       if (mutation.isError) mutation.reset();
     },
     failure:
       mutation.isError && failureCode !== "AGENT_HAS_ACTIVE_RUNS"
-        ? modelSourceErrorCopy(failureCode)
+        ? modelSourceErrorCopy(failureCode, t)
         : undefined,
     pending: mutation.isPending ? mutation.variables : undefined,
     request: (body) => mutation.mutate(body),
@@ -154,9 +142,11 @@ export function useModelSourceSwitch({
   };
   const feedback = (
     <>
-      {notice ? (
+      {switched ? (
         <div className="mt-4">
-          <FormFeedback tone="success">{notice}</FormFeedback>
+          <FormFeedback tone="success">
+            {switchedNotice(switched, t)}
+          </FormFeedback>
         </div>
       ) : null}
       {busy ? (
@@ -175,18 +165,16 @@ export function useModelSourceSwitch({
   return { feedback, switcher };
 }
 
-function switchedNotice(view: ModelSourceView) {
-  if (!view.status) return "Switched.";
+function switchedNotice(view: ModelSourceView, t: Translate) {
+  if (!view.status) return t(m.switched);
   const updated = view.updated_agent_count ?? 0;
   const ended = view.terminated_run_count ?? 0;
-  const parts = [`Agents now use ${activeSourceLabel(view.status)}.`];
-  if (updated)
-    parts.push(
-      `${updated} ${updated === 1 ? "Agent was" : "Agents were"} moved.`,
-    );
-  if (ended)
-    parts.push(`${ended} ${ended === 1 ? "task was" : "tasks were"} ended.`);
-  return parts.join(" ");
+  const parts = [
+    t(m.agentsNowUse, { source: activeSourceLabel(view.status, t) }),
+  ];
+  if (updated) parts.push(t(m.agentsMoved, { count: updated }));
+  if (ended) parts.push(t(m.tasksEnded, { count: ended }));
+  return parts.reduce((first, second) => t(m.sentences, { first, second }));
 }
 
 function TerminateTasksDialog({
@@ -200,24 +188,32 @@ function TerminateTasksDialog({
   onClose: () => void;
   onConfirm: () => void;
 }) {
-  const names = agents.length ? agents.join(", ") : "Some Agents";
+  const t = useT();
   return (
     <ModalDialog
-      description={`${names} ${agents.length === 1 ? "is" : "are"} working on tasks on ${computerName}. Switching now ends those tasks; they can't be resumed.`}
+      description={
+        agents.length
+          ? t(m.terminateDescription, {
+              computer: computerName,
+              count: agents.length,
+              names: joinList(agents, t),
+            })
+          : t(m.terminateDescriptionSome, { computer: computerName })
+      }
       footer={
         <>
-          <Button onClick={onClose}>Cancel</Button>
+          <Button onClick={onClose}>{t(commonMessages.cancel)}</Button>
           <Button onClick={onConfirm} tone="danger">
-            Terminate tasks & Switch
+            {t(m.terminateConfirm)}
           </Button>
         </>
       }
       onClose={onClose}
       size="md"
-      title="End running tasks?"
+      title={t(m.terminateTitle)}
     >
       <p className="px-5 py-4 text-sm text-muted-foreground">
-        To keep them, wait until they finish and switch then.
+        {t(m.terminateBody)}
       </p>
     </ModalDialog>
   );
@@ -233,9 +229,10 @@ export function ModelSourceTabs({
   onChange: (mode: ModelSourceMode) => void;
   value: ModelSourceMode;
 }) {
+  const t = useT();
   return (
     <div
-      aria-label="Model source"
+      aria-label={t(m.modelSource)}
       className="mt-6 inline-flex self-start rounded-lg bg-muted p-0.5"
       role="tablist"
     >
@@ -256,16 +253,16 @@ export function ModelSourceTabs({
           >
             {mode === active ? (
               <span
-                aria-label="In use"
+                aria-label={t(m.inUse)}
                 className="size-1.5 rounded-full bg-app-success"
                 role="img"
               />
             ) : null}
-            {modelSourceModeLabels[mode]}
+            {t(modelSourceModeLabels[mode])}
           </button>
         );
         return mode === "byok" ? (
-          <Hint key={mode} placement="top" text={byokExplanation}>
+          <Hint key={mode} placement="top" text={t(m.byokExplanation)}>
             {tab}
           </Hint>
         ) : (
@@ -286,6 +283,7 @@ export function SwitchToLocalNotice({
   models: readonly LocalModel[];
   switcher: ModelSourceSwitcher;
 }) {
+  const t = useT();
   const [selectedId, setSelectedId] = useState<string | undefined>(undefined);
   const chosen =
     (selectedId
@@ -297,29 +295,36 @@ export function SwitchToLocalNotice({
     <div className="mt-6 flex flex-wrap items-center justify-between gap-3 rounded-xl bg-muted px-4 py-3">
       <p className="min-w-0 flex-1 text-sm text-muted-foreground">
         {single ? (
-          <>
-            <span className="text-foreground">{single.name}</span> is on this
-            computer and can run your Agents locally.
-          </>
-        ) : models.length > 1 ? (
-          "Choose a model on this computer to run your Agents locally."
+          <RichMessage
+            message={m.switchLocalSingle}
+            tags={{
+              model: (text) => <span className="text-foreground">{text}</span>,
+            }}
+            values={{ name: single.name }}
+          />
         ) : (
-          "Download a model below to run your Agents locally."
+          t(models.length > 1 ? m.switchLocalChoose : m.switchLocalDownload)
         )}
       </p>
       <div className="flex shrink-0 flex-wrap items-center gap-2">
         {models.length > 1 && chosen ? (
           <Select
-            aria-label="Local model"
+            aria-label={t(m.modeLocal)}
             onValueChange={setSelectedId}
             value={chosen.id}
             variant="pill"
           >
             {models.map((model) => (
               <SelectItem key={model.id} value={model.id}>
-                {model.name} ·{" "}
-                {model.state === "loaded" ? "Loaded" : "Downloaded"} ·{" "}
-                {formatGigabytes(model.memory_bytes)}
+                {t(
+                  model.state === "loaded"
+                    ? m.localOptionLoaded
+                    : m.localOptionDownloaded,
+                  {
+                    name: model.name,
+                    size: formatGigabytes(model.memory_bytes, t),
+                  },
+                )}
               </SelectItem>
             ))}
           </Select>
@@ -334,338 +339,9 @@ export function SwitchToLocalNotice({
           size="compact"
           tone="primary"
         >
-          Switch to Local model
+          {t(m.switchToLocal)}
         </Button>
       </div>
     </div>
-  );
-}
-
-/** A listed model: its ID, then its name and context window when known. */
-function ByokModelOption({ model }: { model: ByokModel }) {
-  const details = [
-    model.name,
-    model.context_window ? contextLabel(model.context_window) : undefined,
-  ].filter(Boolean);
-  return (
-    <>
-      {details.length ? `${model.id} ` : model.id}
-      {details.length ? (
-        <span className="ml-1 text-xs text-muted-foreground">
-          {details.join(" · ")}
-        </span>
-      ) : null}
-    </>
-  );
-}
-
-function sameEndpointOrigin(savedUrl: string | undefined, nextUrl: string) {
-  const trimmedSaved = savedUrl?.trim();
-  const trimmedNext = nextUrl.trim();
-  if (!trimmedSaved || !trimmedNext) return false;
-  if (trimmedSaved === trimmedNext) return true;
-  try {
-    return new URL(trimmedSaved).origin === new URL(trimmedNext).origin;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * The person's own endpoint. The API key goes to the Computer, which keeps
- * it private; Linger never shows it again.
- */
-export function ByokPanel({
-  computerId,
-  disabled,
-  status,
-  switcher,
-  tenantId,
-}: {
-  computerId: string;
-  disabled: boolean;
-  status: ModelSourceStatus;
-  switcher: ModelSourceSwitcher;
-  tenantId: string;
-}) {
-  const { client } = useTeamHubRuntime();
-  const saved = status.byok;
-  const [runtime, setRuntime] = useState<ModelSourceRuntime>(
-    status.mode === "byok" ? status.runtime : "claude",
-  );
-  const [baseUrl, setBaseUrl] = useState(saved.base_url ?? "");
-  const [apiKey, setApiKey] = useState("");
-  // Starts empty until a model is saved, then shows the saved one.
-  const [modelId, setModelId] = useState(saved.model_id ?? "");
-  const [manualModelEntry, setManualModelEntry] = useState(false);
-  // Models are listed for the address and key as they stand when a field is
-  // left, not on every keystroke.
-  const [listed, setListed] = useState({
-    baseUrl: saved.base_url ?? "",
-    keyRevision: 0,
-  });
-  const [keyEdited, setKeyEdited] = useState(false);
-  const trimmedBaseUrl = baseUrl.trim();
-  // Never reuse a saved key when the owner points BYOK at a different host.
-  const canReuseSavedKey =
-    saved.key_saved &&
-    (!saved.base_url || sameEndpointOrigin(saved.base_url, trimmedBaseUrl));
-  const credentials = apiKey
-    ? { api_key: apiKey }
-    : canReuseSavedKey
-      ? { reuse_saved_key: true }
-      : {};
-  const listedCanReuseSavedKey =
-    saved.key_saved &&
-    (!saved.base_url || sameEndpointOrigin(saved.base_url, listed.baseUrl));
-  const listedCredentials = apiKey
-    ? { api_key: apiKey }
-    : listedCanReuseSavedKey
-      ? { reuse_saved_key: true }
-      : {};
-  const input: ByokInput = {
-    base_url: trimmedBaseUrl,
-    model_id: modelId.trim(),
-    ...credentials,
-  };
-  const models = useQuery({
-    ...byokModelsQueryOptions(
-      client,
-      tenantId,
-      computerId,
-      { base_url: listed.baseUrl, ...listedCredentials },
-      listed.keyRevision,
-    ),
-    // A refresh keeps the current choices on screen until the new list lands,
-    // but clearing the address clears stale options.
-    placeholderData: listed.baseUrl ? keepPreviousData : undefined,
-  });
-  const listedModels = listed.baseUrl ? (models.data?.models ?? []) : [];
-  // A saved or typed ID the endpoint does not list stays choosable.
-  const modelOptions =
-    input.model_id === "" ||
-    listedModels.some((model) => model.id === input.model_id)
-      ? listedModels
-      : [{ id: input.model_id }, ...listedModels];
-  const modelControlId = useId();
-  const modelHintId = `${modelControlId}-hint`;
-  const modelHint = models.isFetching
-    ? "Listing the endpoint's models…"
-    : models.isError
-      ? "The endpoint didn't list its models. Type the model ID."
-      : listedModels.length
-        ? `${listedModels.length} ${listedModels.length === 1 ? "model" : "models"} listed.`
-        : undefined;
-  const showModelSelect = listedModels.length > 0 && !manualModelEntry;
-  // The Computer decides whether the endpoint needs a key: one on this
-  // computer or the local network may have none.
-  const complete = input.base_url !== "" && input.model_id !== "";
-  const test = useMutation({
-    mutationFn: (body: ByokTestRequest) =>
-      testByokEndpoint(client, tenantId, computerId, body),
-  });
-  const active = status.mode === "byok";
-
-  function save(event: FormEvent) {
-    event.preventDefault();
-    switcher.request({ byok: input, mode: "byok", runtime });
-  }
-
-  function listModels() {
-    setKeyEdited(false);
-    setListed((current) => ({
-      baseUrl: input.base_url,
-      keyRevision: current.keyRevision + 1,
-    }));
-  }
-
-  return (
-    <form
-      aria-label="BYOK"
-      className="mt-6 overflow-hidden rounded-xl border border-border"
-      onSubmit={save}
-    >
-      <div className="grid grid-cols-1 gap-4 px-4 py-4">
-        {active && saved.protocol ? (
-          <p className="text-xs text-muted-foreground">
-            In use, through {byokProtocolLabels[saved.protocol]}.
-          </p>
-        ) : null}
-        <div>
-          <p className="mb-1.5 text-sm font-medium text-foreground">
-            AI runtime
-          </p>
-          <Select
-            aria-label="AI runtime"
-            className="w-full"
-            disabled={disabled}
-            onValueChange={(value) => {
-              setRuntime(value as ModelSourceRuntime);
-              // The runtime decides which API format is tried first.
-              test.reset();
-            }}
-            value={runtime}
-          >
-            {byokRuntimes.map((item) => (
-              <SelectItem key={item} value={item}>
-                {modelSourceRuntimeLabels[item]}
-              </SelectItem>
-            ))}
-          </Select>
-        </div>
-        <Field
-          autoComplete="off"
-          disabled={disabled}
-          label="Base URL"
-          onBlur={() =>
-            setListed((current) =>
-              current.baseUrl === input.base_url
-                ? current
-                : { ...current, baseUrl: input.base_url },
-            )
-          }
-          onChange={(event) => {
-            setBaseUrl(event.target.value);
-            test.reset();
-          }}
-          placeholder="https://api.example.com/v1"
-          spellCheck={false}
-          value={baseUrl}
-        />
-        <Field
-          autoComplete="new-password"
-          disabled={disabled}
-          hint={
-            canReuseSavedKey
-              ? "A key is saved on this computer. Leave blank to keep it."
-              : "Optional for an endpoint on this computer or your local network."
-          }
-          label="API key"
-          onBlur={() => {
-            if (!keyEdited) return;
-            setKeyEdited(false);
-            setListed((current) => ({
-              ...current,
-              keyRevision: current.keyRevision + 1,
-            }));
-          }}
-          onChange={(event) => {
-            setApiKey(event.target.value);
-            setKeyEdited(true);
-            test.reset();
-          }}
-          type="password"
-          value={apiKey}
-        />
-        <div>
-          <label
-            className="mb-1.5 block text-sm font-medium text-foreground"
-            htmlFor={modelControlId}
-          >
-            Model
-          </label>
-          <div className="flex flex-wrap gap-2">
-            <div className="min-w-48 flex-1">
-              {showModelSelect ? (
-                <Select
-                  aria-describedby={modelHint ? modelHintId : undefined}
-                  aria-label="Model"
-                  className="w-full"
-                  disabled={disabled}
-                  id={modelControlId}
-                  onValueChange={(value) => {
-                    setModelId(value);
-                    test.reset();
-                  }}
-                  placeholder="Choose a model"
-                  value={input.model_id}
-                >
-                  {modelOptions.map((model) => (
-                    <SelectItem key={model.id} value={model.id}>
-                      <ByokModelOption model={model} />
-                    </SelectItem>
-                  ))}
-                </Select>
-              ) : (
-                <input
-                  aria-describedby={modelHint ? modelHintId : undefined}
-                  autoComplete="off"
-                  className={fieldControlClassName}
-                  disabled={disabled}
-                  id={modelControlId}
-                  onChange={(event) => {
-                    setModelId(event.target.value);
-                    test.reset();
-                  }}
-                  placeholder="provider/model-name"
-                  spellCheck={false}
-                  value={modelId}
-                />
-              )}
-            </div>
-            <Button
-              disabled={disabled || input.base_url === ""}
-              loading={models.isFetching}
-              onClick={listModels}
-              onMouseDown={(event) => event.preventDefault()}
-              size="large"
-            >
-              {models.isFetching ? null : <Icon icon={RefreshIcon} size={16} />}
-              List models
-            </Button>
-          </div>
-          {modelHint || listedModels.length > 0 ? (
-            <div className="mt-1.5 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
-              <p id={modelHintId}>{modelHint}</p>
-              {listedModels.length > 0 ? (
-                <button
-                  className="text-foreground underline underline-offset-2 disabled:opacity-50"
-                  disabled={disabled}
-                  onClick={() => setManualModelEntry((current) => !current)}
-                  type="button"
-                >
-                  {manualModelEntry
-                    ? "Choose from list"
-                    : "Enter model ID manually"}
-                </button>
-              ) : null}
-            </div>
-          ) : null}
-        </div>
-        {test.isSuccess ? (
-          <FormFeedback tone="success">
-            Connected to {test.data.base_url} through{" "}
-            {byokProtocolLabels[test.data.protocol]}. {test.data.model_id} has{" "}
-            {contextLabel(test.data.context_window)} of context.
-          </FormFeedback>
-        ) : null}
-        {test.isError ? (
-          <FormFeedback tone="danger">
-            {modelSourceErrorCopy(
-              test.error instanceof TeamHubError ? test.error.code : undefined,
-            )}
-          </FormFeedback>
-        ) : null}
-      </div>
-      <footer className="flex flex-wrap items-center justify-end gap-2 border-t border-border bg-muted/40 px-4 py-3">
-        <Button
-          disabled={disabled || !complete}
-          loading={test.isPending}
-          onClick={() => test.mutate({ byok: input, runtime })}
-          size="large"
-        >
-          Test connection
-        </Button>
-        <Button
-          disabled={disabled || !complete}
-          loading={switcher.pending?.mode === "byok"}
-          size="large"
-          tone="primary"
-          type="submit"
-        >
-          {active ? "Save" : "Save & Switch to BYOK"}
-        </Button>
-      </footer>
-    </form>
   );
 }

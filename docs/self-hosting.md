@@ -46,6 +46,7 @@ LINGER_SECRET_SEED=<output of: openssl rand -base64 32>
 Voice needs a Soniox key; [Voice](voice.md) shows how to turn it on. To
 develop on the code with hot reload instead, `pnpm dev` runs every service on
 your machine against a PostgreSQL you provide; see
+[Local PostgreSQL 17 for development](local-postgresql.md) and
 [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 To collect the desktop app's diagnostics from your people, run a receiver

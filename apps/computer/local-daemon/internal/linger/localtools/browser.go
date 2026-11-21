@@ -146,6 +146,7 @@ func (op *operation) nativeBrowserCall(ctx context.Context, name string, args js
 			confirmed = !errors.Is(err, mcpproxy.ErrCleanupUnconfirmed)
 			return nil, err
 		}
+		op.browserObservations = browserObservations{}
 	}
 	result, err := op.requestBrowser(ctx, name, args)
 	confirmed = !errors.Is(err, errOutcomeUnknown)
@@ -157,11 +158,16 @@ func (op *operation) nativeBrowserCall(ctx context.Context, name string, args js
 // which later tasks of the same Agent reuse.
 // A rejected token fails the call: it never falls back to the Agent profile.
 func (op *operation) userChromeCall(ctx context.Context, chrome *browserConnection, name string, args json.RawMessage, confirmed *bool) (json.RawMessage, error) {
+	if data := chromeUserDataDirectory(op.manager.env); name == "browser_file_upload" && uploadsFiles(args) && data != "" && extensionFileAccessOff(filepath.Join(data, chrome.Profile)) {
+		*confirmed = true
+		return nil, errUserChromeFileAccess
+	}
 	var err error
 	if op.browser == nil {
 		session, err := op.manager.checkoutUserChrome(ctx, op, chrome)
 		if session != nil {
 			op.browser, op.userChromeSession = session.client, session
+			op.browserObservations = browserObservations{}
 		}
 		if err != nil {
 			*confirmed = !errors.Is(err, mcpproxy.ErrCleanupUnconfirmed)
@@ -187,6 +193,17 @@ func (op *operation) userChromeCall(ctx context.Context, chrome *browserConnecti
 		}
 	}
 	return result, err
+}
+
+var errUserChromeFileAccess = errors.New("BROWSER_FILE_ACCESS_DISABLED: the user's Chrome does not let the Playwright Extension read local files, so no file was attached. Ask the user to open chrome://extensions/?id=" + playwrightExtensionID + " and turn on Allow access to file URLs. Chrome then reloads the extension, which closes the file chooser, and saves the setting a few seconds later. After the user confirms, wait a few seconds, click the upload control again, and call browser_file_upload")
+
+// uploadsFiles reports whether browser_file_upload arguments name files; a
+// call without paths only cancels the file chooser.
+func uploadsFiles(args json.RawMessage) bool {
+	var input struct {
+		Paths []string `json:"paths"`
+	}
+	return json.Unmarshal(args, &input) == nil && len(input.Paths) > 0
 }
 
 // holdBrowserCalls admits one browser call of this Operation at a time. The
@@ -539,8 +556,7 @@ var snapshotLink = regexp.MustCompile(`### Snapshot\n- \[Snapshot\]\(([^)\n]+\.y
 
 // requestBrowser calls one Playwright tool. After an action, Playwright
 // saves the page snapshot to a file and links it. The result carries the
-// snapshot itself instead, so the model sees the changed page without
-// spending a call on browser_snapshot.
+// page observation itself so the model can continue from that read.
 func (op *operation) requestBrowser(ctx context.Context, name string, args json.RawMessage) (json.RawMessage, error) {
 	result, err := op.browser.request(ctx, "tools/call", map[string]any{"name": name, "arguments": args})
 	if err != nil {
@@ -551,8 +567,9 @@ func (op *operation) requestBrowser(ctx context.Context, name string, args json.
 		output = op.userChromeSession.output
 	}
 	result = inlineSnapshot(result, op.spec.WorkingDirectory, output)
-	result = op.pages.observeAction(name, result, output)
-	return result, nil
+	op.pages.observe(result)
+	fullSnapshot := ctx.Value(fullBrowserSnapshotKey{}) == true
+	return op.browserObservations.observeAction(name, args, result, output, fullSnapshot), nil
 }
 
 // inlineSnapshot replaces a snapshot link with the file's text and removes

@@ -41,6 +41,11 @@ import (
 )
 
 func main() {
+	// Codex runs this before every shell command, and the managed Pi
+	// extension before a bash call that may need it.
+	if len(os.Args) == 2 && os.Args[1] == "shell-text-hook" {
+		os.Exit(permission.ShellTextHook(os.Stdin, os.Stderr))
+	}
 	// Codex runs this for every PermissionRequest of a reviewed Run; it only
 	// forwards the hook to the running Daemon.
 	if len(os.Args) == 3 && os.Args[1] == "permission-hook" {
@@ -203,7 +208,7 @@ func run(args []string) (resultErr error) {
 	if err != nil {
 		return err
 	}
-	providers, runtimes := providerInstallations(discovered, providerEnvironment)
+	providers, runtimes := providerInstallations(discovered, providerEnvironment, localModelsStateDir)
 	providerCatalog := lingercontext.NewProviderCatalog(providers)
 	workspaceGrants := make(map[string]lingercontext.WorkspaceGrant)
 	wireGrants := make([]map[string]any, 0, len(computer.WorkspaceGrants))
@@ -287,6 +292,8 @@ func run(args []string) (resultErr error) {
 			resolver.ToolGuide = localtools.MacToolGuide
 		} else if runtime.GOOS == "linux" {
 			resolver.ToolGuide = localtools.NativeLinuxToolGuide
+		} else if runtime.GOOS == "windows" {
+			resolver.ToolGuide = localtools.WindowsToolGuide
 		}
 		if toolManager.ConnectsEverydayBrowser() {
 			browserConnections = toolManager
@@ -349,7 +356,7 @@ func run(args []string) (resultErr error) {
 	defer localModels.Close()
 	applyDiscovered := func(publishCtx context.Context, next provider.DiscoveryResult) error {
 		logRuntimeDiagnostics(next.Diagnostics)
-		nextProviders, nextRuntimes := providerInstallations(next, currentProviderEnvironment())
+		nextProviders, nextRuntimes := providerInstallations(next, currentProviderEnvironment(), localModelsStateDir)
 		providerCatalog.Replace(nextProviders)
 		if controller != nil {
 			controller.UpdateDiagnostics(next.Diagnostics)
@@ -393,6 +400,7 @@ func run(args []string) (resultErr error) {
 			TempBase: operationTempBase, RuntimeHomeRoot: filepath.Join(computer.StateDirectory, "runtime-homes"),
 			CodexModelSessionHome: codexModelSessions.Home(),
 			PiMCPExtension:        piExtension,
+			ShellTextHook:         executable,
 		}, OperationResolver: resolver,
 		Ledger: daemon.NewMemoryLedger(), Registrations: registrationStore, Assignments: assignmentStore, ContextViews: views,
 		LocalSkills: localSkills, LocalTools: toolBinder,
@@ -726,7 +734,7 @@ func runtimeObservations(computer computerconfig.Config, diagnostics []provider.
 	return result
 }
 
-func providerInstallations(discovered provider.DiscoveryResult, environment map[string]string) (map[string]lingercontext.ProviderInstallation, []string) {
+func providerInstallations(discovered provider.DiscoveryResult, environment map[string]string, localModelsStateDir string) (map[string]lingercontext.ProviderInstallation, []string) {
 	providers := make(map[string]lingercontext.ProviderInstallation, len(discovered.Installations))
 	runtimes := make([]string, 0, len(discovered.Installations))
 	for runtimeType, diagnostic := range discovered.Installations {
@@ -743,9 +751,12 @@ func providerInstallations(discovered provider.DiscoveryResult, environment map[
 				contextWindows[model.ID] = model.ContextWindow
 			}
 		}
+		gateway := localmodels.GatewayRuntime(environment, localModelsStateDir, runtimeType)
 		providers[runtimeType] = lingercontext.ProviderInstallation{
 			Type: runtimeType, ExecutablePath: diagnostic.ExecutablePath, EntryPath: diagnostic.EntryPath,
 			Environment: runtimeEnvironment, Version: diagnostic.Version, ContextWindows: contextWindows,
+			ModelGateway: gateway,
+			APILink:      gateway || slices.ContainsFunc(diagnostic.Models, provider.RuntimeModel.OnAPILink),
 		}
 		runtimes = append(runtimes, runtimeType)
 	}

@@ -32,7 +32,11 @@ const operationProviderPrepareKind = "internal.provider.prepare"
 
 type OperationSpec struct {
 	// A continuation prompt requires the exact native history of the interrupted Task.
-	ResumeAfterYield  bool
+	ResumeAfterYield bool
+	// SessionMoved is called when a started Run continues in a new native
+	// session because its retained one is gone. The Run announced the old
+	// session, so it must not yield to it.
+	SessionMoved      func()
 	HumanInteractions bool
 	// PermissionReview sends the Runtime's own permission prompts to the
 	// Runtime permission review (Agent Service declares it per Run).
@@ -61,8 +65,9 @@ type OperationSpec struct {
 	LocalEvidence func(ctx context.Context, tool, input string) *permission.Evidence
 	// LocalAllowed reports whether a local browser or desktop call runs
 	// without review.
-	LocalAllowed     func(tool, input string) bool
-	ClaudeSkillNames []string
+	LocalAllowed         func(tool, input string) bool
+	RegisterToolReviewer func(*permission.Reviewer) (func(), error)
+	ClaudeSkillNames     []string
 	// ContextSkillDigest identifies the Skill packages of the Context View
 	// the Daemon published into the workspace.
 	ContextSkillDigest      string
@@ -77,11 +82,14 @@ type OperationSpec struct {
 	RegistrationID          string
 	DaemonVersion           string
 	CodexVersion            string
-	TenantID                string
-	OwnerActorID            string
-	AgentID                 string
-	ComputerID              string
-	ScopeID                 string
+	// WithoutNativeWebTools turns off the Runtime's own web search and page
+	// fetch, which a model served through the localmodels gateway cannot run.
+	WithoutNativeWebTools bool
+	TenantID              string
+	OwnerActorID          string
+	AgentID               string
+	ComputerID            string
+	ScopeID               string
 	// ContextWindow is the selected model's context length in tokens as
 	// Runtime discovery resolved it; zero when unknown.
 	ContextWindow int
@@ -113,6 +121,9 @@ type Executor struct {
 	// of a models cache for a Context's new home.
 	CodexModelSessionHome string
 	PiMCPExtension        string
+	// ShellTextHook is the Daemon's own executable, which Runs start as
+	// shell-text-hook before a shell command; empty runs no hook.
+	ShellTextHook string
 }
 
 type Result struct {
@@ -166,6 +177,7 @@ func (e Executor) PrepareProvider(ctx context.Context, spec OperationSpec) (Resu
 	spec.TrustedLocalMCPTools = nil
 	spec.LocalEvidence = nil
 	spec.LocalAllowed = nil
+	spec.RegisterToolReviewer = nil
 	execution, err := e.Start(ctx, spec, func(context.Context, protocol.Event) error { return nil })
 	if err != nil {
 		return Result{}, err
@@ -531,6 +543,14 @@ func (e Executor) Start(ctx context.Context, spec OperationSpec, emit EmitFunc) 
 				RuntimeVersion: spec.CodexVersion, Platform: runtime.GOOS, Workspace: spec.WorkingDirectory,
 			}}
 		}
+		if spec.RegisterToolReviewer != nil {
+			release, err := spec.RegisterToolReviewer(reviewer)
+			if err != nil {
+				finish(Result{Status: "failed", Error: err.Error()})
+				return
+			}
+			defer release()
+		}
 		runtimeHomePath := ""
 		if runtimeHome != nil {
 			runtimeHomePath = runtimeHome.Path
@@ -539,6 +559,7 @@ func (e Executor) Start(ctx context.Context, spec OperationSpec, emit EmitFunc) 
 			HumanInteraction:      questions,
 			PermissionReviewer:    reviewer,
 			CodexPermissionHook:   codexHook,
+			ShellTextHook:         e.ShellTextHook,
 			RuntimeHome:           runtimeHomePath,
 			Dir:                   spec.WorkingDirectory,
 			SharedTaskLink:        permission.CodexTaskLink{Path: spec.SharedTask.WritableTaskLink, Target: spec.SharedTask.WritableTaskRoot},
@@ -549,12 +570,14 @@ func (e Executor) Start(ctx context.Context, spec OperationSpec, emit EmitFunc) 
 			AssignSessionID:       spec.CreateProviderSessionID,
 			ResumeID:              spec.ResumeSessionID,
 			ResumeRequired:        spec.ResumeSessionID != "",
+			FreshSession:          freshSession(spec),
 			Budget:                spec.Timeout,
 			ComputerArgs:          append([]string(nil), spec.ExtraArgs...),
 			AgentArgs:             append([]string(nil), spec.CustomArgs...),
 			MCPServers:            mcpConfig,
 			Effort:                spec.ThinkingLevel,
 			ContextWindow:         spec.ContextWindow,
+			WithoutNativeWebTools: spec.WithoutNativeWebTools,
 			Title:                 spec.ThreadName,
 			AppendPrompt:          spec.SystemPrompt,
 			BaseInstructions:      spec.BaseInstructions,
@@ -663,8 +686,13 @@ func (e Executor) Start(ctx context.Context, spec OperationSpec, emit EmitFunc) 
 			finish(Result{Status: "failed", Error: executionFailure, CleanupUnconfirmed: providerResult.ExitUnconfirmed})
 			return
 		}
+		// The Agent Service takes the stream's last text message as the reply and
+		// requires it to equal the result's. When only one side has text, either a
+		// Runtime that streams nothing or an empty final answer after streamed
+		// commentary, a closing message carries the result's reply.
+		resultHasText := providerResult.Output != ""
 		if spec.OperationKind == "run.start" && providerResult.Status == "completed" &&
-			!emittedResponseText && providerResult.Output != "" {
+			emittedResponseText != resultHasText {
 			for _, projected := range projection.project(native.Event{Kind: native.EventText, ID: stableEventID("message", spec.TaskID+"\x00final"), Body: providerResult.Output}) {
 				payload, marshalErr := json.Marshal(projected)
 				if marshalErr != nil {
@@ -707,7 +735,9 @@ func normalizeMessage(message native.Event, operationID string) any {
 	if callID == "" {
 		callID = stableEventID("call", operationID+"\x00"+message.ToolName+"\x00"+message.Body)
 	}
-	toolName := message.ToolName
+	// The Runner Gateway caps a tool name at 200 characters and fails the
+	// Operation on a longer one; a Runtime may name a tool by its arguments.
+	toolName := clip(message.ToolName, 200)
 	if toolName == "" {
 		toolName = "provider_tool"
 	}
@@ -782,16 +812,10 @@ func retireClaudeResident(home string) error {
 	return native.StopParkedClaudeResidentForCredentials(filepath.Join(home, "sessions"))
 }
 
-// codexBatchedInputs are the macOS desktop inputs that Codex sends only as
-// run_actions steps.
-var codexBatchedInputs = []any{"click", "double_click", "right_click", "drag", "scroll", "type_text", "press_key", "hotkey"}
-
 // codexDirectLocalTools gives Codex the Daemon's own computer and browser
 // tools as plain function tools, as Codex's computer-use plugin does with its
 // REPL: outside code mode and never deferred. A call is then a JSON function
 // call, not a script that wraps each tool in text(await tools.mcp__...).
-// Desktop inputs go only through run_actions, Codex's one-script-per-call
-// shape, so the model plans several steps in one call.
 func codexDirectLocalTools(mcpConfig json.RawMessage, localTools []string) (json.RawMessage, error) {
 	if len(mcpConfig) == 0 || len(localTools) == 0 {
 		return mcpConfig, nil
@@ -805,9 +829,6 @@ func codexDirectLocalTools(mcpConfig json.RawMessage, localTools []string) (json
 		name, _, ok := strings.Cut(strings.TrimPrefix(tool, "mcp__"), "__")
 		if settings, found := servers[name].(map[string]any); ok && found {
 			settings["omit_tools_from"] = []any{"code_mode", "deferred"}
-			if name == "computer" {
-				settings["disabled_tools"] = codexBatchedInputs
-			}
 		}
 	}
 	return json.Marshal(parsed)
@@ -841,6 +862,19 @@ func prepareCodexPermissionReview(codexHome string, teamhubCommands []permission
 // declares it per Run; session and preparation Operations never prompt.
 func (spec OperationSpec) ReviewsPermissions() bool {
 	return spec.PermissionReview && spec.OperationKind == "run.start"
+}
+
+// freshSession lets a started Run continue in a new native session, except
+// one resuming after a yield, whose prompt continues the old session.
+func freshSession(spec OperationSpec) func() {
+	if spec.ResumeAfterYield {
+		return nil
+	}
+	return func() {
+		if spec.SessionMoved != nil {
+			spec.SessionMoved()
+		}
+	}
 }
 
 // startsFreshSession reports whether a Run whose retained native session the

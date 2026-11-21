@@ -23,6 +23,11 @@ build:assets` to check the initial JS budget.
 - `src/app`: routes, providers, route error boundaries, and global CSS.
 - `src/features/teamhub`: Human API, Session, error, and realtime adapters.
 - `src/features/rooms`: Room routes, Chat, Timeline, the right sidebar (Agent Info, Activity, Thread, Document) and membership UI.
+- `src/features/web-search`: web search backend queries, bundled provider
+  logos and the key field. The chat's search key card reads the backend list
+  with `include_quota=false`, so it never makes TeamHub call a provider; the
+  Connectors Web search group reads it with live quota. Saving a key or the
+  default from either refreshes both.
 - `src/features/local-models`: Settings › Models (`settings/models?computer=<id>`).
   Its tabs read and switch the Computer's model source (Local model, BYOK)
   through TeamHub's `model-source` API, which asks the Computer live; the page
@@ -30,8 +35,12 @@ build:assets` to check the initial JS budget.
   Local model; the page never holds a saved API key (reusing a saved key only
   for the saved endpoint's origin, clearing entered keys after saving, offering
   manual model ID entry even when endpoints list models, and disabling BYOK
-  edits while offline), and a switch refused with `AGENT_HAS_ACTIVE_RUNS`
-  retries with `force_terminate` only after the owner confirms. The Local model
+  edits while offline). BYOK addresses requests as base URL + path + endpoint
+  and sends the format the address's ending names (else the Runtime's own);
+  it lists models only on request and shows a Test result as a floating
+  message, with the Computer's own message for endpoint refusals. A switch
+  refused with `AGENT_HAS_ACTIVE_RUNS` retries with `force_terminate` only
+  after the owner confirms. The Local model
   tab is one Computer's model library as TeamHub last stored it. The Computer
   decides fit, availability, placement, the recommendation and memory; the page
   only orders and labels them, picks the Make room default (including
@@ -65,6 +74,14 @@ build:assets` to check the initial JS budget.
   accounts for) when unloading models cannot free enough, and says a model
   cannot fit only when it needs more than the pool's total. A Computer's detail
   on the Computers page links here and reads no model state itself.
+- `src/i18n`: the interface languages (English and Simplified Chinese).
+  `messages.ts` re-exports the React-free core from
+  `@linger/service-kit/messages`, which the desktop shell shares,
+  `language.ts` holds the language on screen and the stored choice,
+  `desktop-language.ts` reports a stored choice to the desktop app so its
+  menus and pages follow, `use-translation.tsx` is the React side, and
+  `locales/` holds one catalog per translated language plus its glossary,
+  which the desktop catalog follows too.
 - `src/test`: unit-test support, including the in-process TeamHub test server.
 - `e2e`: Playwright product workflows; every spec runs on the real TeamHub and
   Document Runtime stack (`make check-e2e-room-document`).
@@ -93,9 +110,23 @@ build:assets` to check the initial JS budget.
   During Live, the Meeting entry offers to start a new Meeting even while an
   earlier one is saving. Both in-page voice windows retain a visible, draggable
   title bar: dark in browsers, the window's own surface colour in the desktop
-  app. Picture-in-picture keeps the browser title bar. The desktop app cannot
-  open picture-in-picture, so there voice windows stay in the page, offer no
-  float button, and on macOS stay out of the window drag strip.
+  app. Picture-in-picture keeps the browser title bar. The desktop app floats
+  them in its own always-on-top window, which stays up while the main window
+  is minimized or closed to the tray: when the preload offers
+  `window.lingerDesktop.voiceWindow`, `voice-pip.ts` opens it with
+  `window.open("")` (the desktop main process allows only that call) and is
+  the only place that knows which kind of window it got. A desktop app without that field keeps voice windows
+  in the page with no float button. In the page on macOS they stay out of the
+  window drag strip. In the page both windows resize by any edge or corner
+  (`voice-window-resize.tsx`), down to a minimum size and never past the
+  viewport; the corner grip also takes arrow keys. Dragging the title bar
+  keeps the whole window inside the viewport too, and a window that grows
+  where it sits, or whose viewport shrinks, moves back in. Neither window can
+  be taller than the viewport leaves room for, so the header stays reachable.
+  The size lasts while the window is open and is not stored. Voice Mode's expand button switches
+  between its two preset sizes and drops a dragged size; a minimized
+  recording resizes in width only. A floated window has no handles: the
+  browser or the desktop app resizes it.
 - The compact primary rail reveals labels on hover and keyboard focus without
   moving link hit areas or neighbouring links. A stationary pointer at an edge
   must not trigger repeated hover enter/leave; sidebar expansion and Chat list
@@ -118,6 +149,12 @@ build:assets` to check the initial JS budget.
 - Recording and Voice Mode distinguish the native window's close action from
   back to tab through the shared PiP return detection. Back to tab keeps the
   session running in the page and exposes a Float action; close ends it.
+  Every floated window also draws its own return button, in the browser and
+  in the desktop app: `returnVoicePipToPage` brings the tab or the main
+  window to the front, reports the return itself and closes the floated
+  window. Voice Mode then opens the Room the call started in; a recording
+  stays on the page the main window shows. The desktop app's window has no
+  back to tab button, so every other close of it ends the session.
   Recording moves one portal host between documents so paused state, Ask
   drafts and transcript scroll survive the move. Hide it while classifying a
   native close, and ignore a late result after unmount or a replacement window.
@@ -207,3 +244,68 @@ build:assets` to check the initial JS budget.
   React Doctor catches this and it renders fine in unit tests, so assert the outcome
   (the wrapper carries the positioning, the clamped node carries no `block`) in a test
   and confirm that test fails when the utility is put back on the same element.
+- Interface text on a translated surface comes from a message, not a literal.
+  English is the source and the fallback: a string with no translation shows
+  its English text.
+  - Add a string: declare it in the feature's `*.messages.ts` with
+    `defineMessages("<namespace>", { name: "English text" })`, show it with
+    `const t = useT()` and `t(messages.name)`, and add the same
+    `<namespace>.<name>` to `src/i18n/locales/zh-CN.json` following
+    `src/i18n/locales/zh-CN.glossary.md`. `src/i18n/catalog.test.ts` fails when
+    a key, a `{placeholder}`, a `<tag>` or a plural form is missing from a
+    catalog, or when a catalog keeps a key the source no longer has.
+  - Values go in `{name}` placeholders (`t(m.space, { name })`); never join
+    translated fragments into a sentence, because word order differs. A count
+    is a plural message, `{ one: "{count} file", other: "{count} files" }`,
+    called with `count`; a catalog lists the plural forms of its own language.
+    An element inside a sentence is a `<name>…</name>` span rendered with
+    `RichMessage`, which keeps user-supplied text as text.
+  - Outside React (a toast, an error built in a helper) call `translate()`
+    when the text is shown, never at module load: a module-level string keeps
+    the language it was created in after the Human switches.
+  - Dates and numbers inside translated text take `formatLocale(language)`.
+    `lib/date-format.ts` stays on `APP_LOCALE` for surfaces that are still
+    English, so one screen does not mix an English sentence with a Chinese
+    date; a translated surface passes its locale or translation to those
+    helpers.
+  - A label on a translated surface follows the language, so CSS and DOM
+    queries never select by its text. Use a class or a `data-*` marker such as
+    `data-voice-area` and `data-chat-composer`, not `[aria-label="…"]`.
+  - A translated control tells Voice Mode what clicking it does with a
+    marker, never with words in its label: `data-voice-risk="never"` for
+    deleting, removing, sending, leaving, signing out, paying, archiving or
+    discarding (spoken commands never click it, the live model asks first),
+    `data-voice-risk="confirm"` for other decisions such as approve, deny or
+    revoke (the live model asks first), and `data-voice-close` on the button
+    that closes its panel or dialog. An `ActionMenu` item takes `voiceRisk`.
+    `voice-risk-markers.test.ts` fails when a control named by such a message
+    lacks its marker.
+  - Text this client keeps beyond the screen (the Outbox, saved state) is
+    stored as a reason or a key and worded when it is shown, so it follows a
+    language switch and a reload. `pending-message-failure.ts` is the pattern:
+    the Outbox stores `failure.reason`, the hook words it with `t`.
+  - Names and text that people or Agents wrote (Agent names, message
+    previews, a published template) are data and are shown as they are.
+  - TeamHub's own English is worded here from what it means, never translated
+    on the server: a status from its stable code
+    (`agent-availability-text.ts`), a card's ask from its kind and fields
+    (`card-prompts.ts`). A code or kind this client does not know shows
+    TeamHub's English.
+  - Errors are worded from the code only when TeamHub's message says nothing
+    more (`teamhub-error-text.ts`: expired sign-in, rate limit, server error,
+    a response without a TeamHub body). `FORBIDDEN`, `CONFLICT`, `NOT_FOUND`,
+    `INVALID_REQUEST` and the like keep TeamHub's message, which says what to
+    do; a case worth its own wording needs its own code from TeamHub.
+  - Fixed catalog text (`web-search-backend-text.ts`, `app-groups.ts`,
+    `builtin-template-text.ts`, `runtime-model-label.ts`) keeps a copy by id
+    for other languages only, through `teamHubCatalogText`: English shows
+    TeamHub's text, so a change on the server shows at once.
+  - Add a language: add it to `LANGUAGES` and `catalogLoaders` in
+    `src/i18n/language.ts` and add `src/i18n/locales/<tag>.json`. Catalogs
+    load on demand, so English users download none.
+  - The choice is stored on the device (`localStorage["linger.language"]`);
+    an absent value means no explicit choice, which is English today. Tests
+    start in English: `src/test/setup.ts` resets the language after each test,
+    and a test of translated text reads the expected string from the catalog
+    instead of writing Chinese, which the repository gate allows only under
+    `src/i18n/locales/`.

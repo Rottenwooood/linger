@@ -6,6 +6,7 @@ import {
   Loading03Icon,
   Mic01Icon,
   PauseIcon,
+  PictureInPictureExitIcon,
   PictureInPictureOnIcon,
   PlayIcon,
   StopIcon,
@@ -13,6 +14,10 @@ import {
 import { useState, type PointerEvent, type ReactNode } from "react";
 import { Icon } from "@/components/ui/icon";
 import { Button } from "@/components/ui/button";
+import { commonMessages } from "@/i18n/common.messages";
+import type { Translate } from "@/i18n/language";
+import type { Message } from "@/i18n/messages";
+import { useT } from "@/i18n/use-translation";
 import {
   isTranscriptRecoveryPaused,
   useOptionalVoiceControl,
@@ -30,6 +35,7 @@ import {
   useSurfaceAction,
   useVoiceArming,
 } from "./voice-focus-state";
+import { recordingMessages as m } from "./recording.messages";
 
 export type RecordingView = "transcript" | "ask";
 
@@ -48,28 +54,36 @@ export interface RecordingPanels {
  */
 export function VoiceFocusSurface({
   autoStart = false,
+  fill = false,
   floating = "page",
   onExit,
   onFloat,
   onMoveStart,
+  onReturn,
   onViewChange,
   panels,
   view,
 }: {
   autoStart?: boolean;
+  /** The in-page window has a height of its own, which the surface fills
+   *  instead of growing with its transcript. */
+  fill?: boolean;
   /** A picture-in-picture window fills its own window instead of floating. */
   floating?: "page" | "pip";
   onExit: () => void;
-  /** Returns the page window to the always-on-top browser window. */
+  /** Returns the page window to the always-on-top window. */
   onFloat?: () => void;
   /** Starts moving the in-page window from its title bar. */
   onMoveStart?: (event: PointerEvent<HTMLDivElement>) => void;
+  /** Brings the always-on-top window back into the page. */
+  onReturn?: () => void;
   onViewChange?: (view: RecordingView | undefined) => void;
   /** Present once a recording runs; before that only the transcript shows. */
   panels?: RecordingPanels;
   /** The open view; undefined minimizes the window to its top row. */
   view?: RecordingView;
 }) {
+  const t = useT();
   const livekit = useOptionalVoiceControl();
   const voice = livekit;
   const { actionError, actionPending, run } = useSurfaceAction();
@@ -118,7 +132,7 @@ export function VoiceFocusSurface({
       ? livekit.captureState
       : undefined;
   const captureError = failedState
-    ? captureFailureDescription(failedState.reason)
+    ? captureFailureDescription(failedState.reason, t)
     : undefined;
   const inputInterrupted =
     captureActive &&
@@ -150,36 +164,38 @@ export function VoiceFocusSurface({
       !voice.boundDevice);
   const visibleItems = idle ? [] : voice.transcriptItems;
   const partial = idle || captureError ? undefined : voice.partialTranscript;
-  const title = recoveryFailed
-    ? "Recording saved. Transcript recovery paused"
+  const titleMessage = recoveryFailed
+    ? m.titleRecoveryPaused
     : inputInterrupted
-      ? "Recording input was interrupted"
+      ? m.titleInputInterrupted
       : standby
-        ? "Recording is continuing in another tab"
+        ? m.titleOtherTab
         : idle
           ? armTitle(armStatus)
           : focusTitle(captureStatus);
-  const subtitle = recoveryFailed
-    ? "Retry transcription or download the original recording."
+  const title = t(titleMessage);
+  const subtitleMessage = recoveryFailed
+    ? m.subtitleRecoveryPaused
     : inputInterrupted
-      ? "Recorded content can still be saved."
+      ? m.subtitleInputInterrupted
       : idle
         ? armSubtitle(armStatus, microphonePermission)
         : focusSubtitle(captureStatus);
+  const subtitle = subtitleMessage && t(subtitleMessage);
   const statusMessage =
     !captureError &&
     (inputReconnecting
-      ? "Reconnecting microphone; audio delivery is not yet confirmed"
+      ? t(m.statusReconnectingMicrophone)
       : livekit?.transcriptStatus === "recovering"
-        ? "Reconnecting transcript updates; saved text will sync after reconnection"
+        ? t(m.statusReconnectingTranscript)
         : livekit?.captureSyncStatus === "recovering"
-          ? "Reconnecting recording status; waiting for server confirmation"
+          ? t(m.statusReconnectingRecording)
           : transcriptIncomplete
             ? inputInterrupted
-              ? "Some transcript segments are unconfirmed. Recovery will be attempted after stopping."
-              : "Some transcript segments are unconfirmed. Recording continues; recovery will be attempted after stopping."
+              ? t(m.statusUnconfirmedAfterStop)
+              : t(m.statusUnconfirmed)
             : finalizing
-              ? "Generating recording and transcript files"
+              ? t(m.statusGeneratingFiles)
               : undefined);
   const surfaceError =
     actionError ??
@@ -205,10 +221,11 @@ export function VoiceFocusSurface({
   // window can sit at the bottom of the viewport; Stop asks inside that row.
   const compactConfirmation = !shown;
   // The listening title is the quiet default; anything else is news.
-  const notice = captureActive && title !== listeningTitle ? title : undefined;
+  const notice =
+    captureActive && titleMessage !== m.titleListening ? title : undefined;
   const tabs: { id: RecordingView; label: string }[] = [
-    { id: "transcript", label: "Transcript" },
-    { id: "ask", label: "Ask" },
+    { id: "transcript", label: t(m.transcriptTab) },
+    { id: "ask", label: t(m.askTab) },
   ];
   const togglePause = () =>
     run(async () => {
@@ -244,11 +261,11 @@ export function VoiceFocusSurface({
     >
       {panels ? (
         <button
-          aria-label={shown ? "Minimize recording" : "Open recording"}
+          aria-label={t(shown ? m.minimize : m.open)}
           className={styles.windowButton}
           disabled={confirmingStop}
           onClick={() => onViewChange?.(shown ? undefined : "transcript")}
-          title={shown ? "Minimize; recording continues" : "Open recording"}
+          title={t(shown ? m.minimizeHint : m.open)}
           type="button"
         >
           {shown ? (
@@ -258,17 +275,28 @@ export function VoiceFocusSurface({
           )}
         </button>
       ) : null}
-      <span className="flex-1">{pip ? null : "Meeting"}</span>
+      <span className="flex-1">{pip ? null : t(m.meeting)}</span>
       {onFloat ? (
         <button
-          aria-label="Float recording window"
+          aria-label={t(m.float)}
           className={styles.windowButton}
           disabled={confirmingStop}
           onClick={onFloat}
-          title="Float over other tabs and apps"
+          title={t(m.floatHint)}
           type="button"
         >
           <Icon icon={PictureInPictureOnIcon} />
+        </button>
+      ) : null}
+      {onReturn ? (
+        <button
+          aria-label={t(m.returnToLinger)}
+          className={styles.windowButton}
+          onClick={onReturn}
+          title={t(m.returnHint)}
+          type="button"
+        >
+          <Icon icon={PictureInPictureExitIcon} />
         </button>
       ) : null}
     </div>
@@ -277,15 +305,19 @@ export function VoiceFocusSurface({
     <>
       {titleBar}
       <section
-        aria-label="Hardware voice focus"
+        aria-label={t(m.surface)}
         className={
           pip
             ? "relative flex min-h-0 flex-1 flex-col bg-app-canvas text-app-ink"
-            : `relative flex max-h-[min(720px,calc(100dvh-132px))] min-h-0 flex-col overflow-hidden rounded-b-2xl bg-app-canvas text-app-ink ${styles.window}`
+            : `relative flex min-h-0 flex-col overflow-hidden rounded-b-2xl bg-app-canvas text-app-ink ${styles.window} ${
+                fill ? "flex-1" : "max-h-[min(720px,calc(100dvh-132px))]"
+              }`
         }
         data-paused={paused || undefined}
       >
-        <header className="flex h-14 shrink-0 items-center gap-2 px-4">
+        {/* A window narrower than its controls keeps their icons and drops
+          the words, which stay as each control's name. */}
+        <header className="@container flex h-14 shrink-0 items-center gap-2 px-4">
           {captureActive ? (
             <>
               <span aria-hidden="true" className={styles.liveBars}>
@@ -295,11 +327,11 @@ export function VoiceFocusSurface({
                 <i />
               </span>
               <span
-                aria-label="Recording duration"
+                aria-label={t(m.duration)}
                 className={`flex shrink-0 items-center gap-2 font-mono text-sm leading-5 tracking-normal tabular-nums ${paused ? "text-app-subtle" : "text-app-ink"}`}
               >
                 <span className="sr-only">
-                  {paused ? "Recording paused" : "Recording"}
+                  {t(paused ? m.recordingPaused : m.recording)}
                 </span>
                 <VoiceRecordingTime
                   pausedAt={pauseState.pausedAt}
@@ -322,13 +354,13 @@ export function VoiceFocusSurface({
           <span className="flex-1" />
           {captureActive ? (
             <button
-              aria-label={paused ? "Resume recording" : "Pause recording"}
+              aria-label={t(paused ? m.resumeRecording : m.pauseRecording)}
               aria-pressed={paused}
               className={styles.control}
               data-active={paused || undefined}
               disabled={standbyOrMic || actionPending}
               onClick={() => void togglePause()}
-              title={paused ? "Resume recording" : "Pause recording"}
+              title={t(paused ? m.resumeRecording : m.pauseRecording)}
               type="button"
             >
               {paused ? (
@@ -336,15 +368,20 @@ export function VoiceFocusSurface({
               ) : (
                 <Icon icon={PauseIcon} size={14} />
               )}
-              {paused ? "Resume" : "Pause"}
+              <span className="@max-[255px]:sr-only">
+                {t(paused ? m.resume : m.pause)}
+              </span>
             </button>
           ) : null}
           <button
-            aria-label={captureActive ? "Stop recording" : "Close recording"}
+            aria-label={t(captureActive ? m.stopRecording : m.closeRecording)}
             className={styles.control}
+            // Only Close closes the window by voice; Stop ends the recording
+            // and asks first, as its English name never closed it.
+            data-voice-close={captureActive ? undefined : ""}
             disabled={actionPending}
             onClick={close}
-            title={captureActive ? "Stop recording" : "Close recording"}
+            title={t(captureActive ? m.stopRecording : m.closeRecording)}
             type="button"
           >
             {captureActive ? (
@@ -352,7 +389,9 @@ export function VoiceFocusSurface({
             ) : (
               <Icon icon={Cancel01Icon} size={14} />
             )}
-            {captureActive ? "Stop" : "Close"}
+            <span className="@max-[255px]:sr-only">
+              {t(captureActive ? m.stop : commonMessages.close)}
+            </span>
           </button>
         </header>
         {confirmingStop ? (
@@ -374,7 +413,7 @@ export function VoiceFocusSurface({
                 }
                 id="recording-stop-title"
               >
-                Stop recording?
+                {t(m.confirmStopTitle)}
               </h2>
               <p
                 className={
@@ -382,8 +421,7 @@ export function VoiceFocusSurface({
                 }
                 id="recording-stop-description"
               >
-                The recording is saved and summarized. You can find it in
-                Meetings.
+                {t(m.confirmStopBody)}
               </p>
               <div
                 className={
@@ -404,7 +442,7 @@ export function VoiceFocusSurface({
                   type="button"
                 >
                   <Icon icon={StopIcon} size={12} />
-                  Stop & save
+                  {t(m.stopAndSave)}
                 </button>
                 <button
                   // eslint-disable-next-line jsx-a11y/no-autofocus -- the safe choice is focused on purpose because the user just asked to stop recording
@@ -419,7 +457,7 @@ export function VoiceFocusSurface({
                   }}
                   type="button"
                 >
-                  Keep recording
+                  {t(m.keepRecording)}
                 </button>
               </div>
             </div>
@@ -429,7 +467,7 @@ export function VoiceFocusSurface({
           <>
             {panels ? (
               <div
-                aria-label="Recording views"
+                aria-label={t(m.views)}
                 className="flex shrink-0 items-center gap-1 border-b border-app-border px-4 py-2"
                 role="tablist"
               >
@@ -481,7 +519,7 @@ export function VoiceFocusSurface({
               >
                 <div className="flex w-full flex-col items-center gap-4 px-5 py-3">
                   <div
-                    aria-label="Voice focus transcript"
+                    aria-label={t(m.transcript)}
                     aria-live="polite"
                     className="w-full space-y-1"
                     role="log"
@@ -501,20 +539,24 @@ export function VoiceFocusSurface({
                     ) : null}
                     {visibleItems.length === 0 && !partial ? (
                       <p className="py-3 text-center text-[12px] leading-[18px] text-app-muted">
-                        {idle
-                          ? "This recording’s transcript will appear here. View previous transcripts in the chat."
-                          : captureError
-                            ? "No transcript is available yet."
-                            : "Listening…"}
+                        {t(
+                          idle
+                            ? m.transcriptPlaceholder
+                            : captureError
+                              ? m.noTranscript
+                              : m.listening,
+                        )}
                       </p>
                     ) : null}
                     {canStart ? (
                       <div className="flex justify-center pt-1">
                         <Button onClick={() => void arm()} tone="primary">
                           <Icon icon={Mic01Icon} size={16} />
-                          {captureFailed || recoveryFailed
-                            ? "Start new recording"
-                            : "Start recording"}
+                          {t(
+                            captureFailed || recoveryFailed
+                              ? m.startNewRecording
+                              : m.startRecording,
+                          )}
                         </Button>
                       </div>
                     ) : null}
@@ -533,8 +575,6 @@ export function VoiceFocusSurface({
     </>
   );
 }
-
-const listeningTitle = "I’m listening to the meeting...";
 
 function VoiceFocusNotices({
   finalizing,
@@ -557,6 +597,7 @@ function VoiceFocusNotices({
   subtitle?: string;
   surfaceError?: string;
 }) {
+  const t = useT();
   if (
     !notice &&
     !subtitle &&
@@ -595,8 +636,10 @@ function VoiceFocusNotices({
             size={12}
           />
           <span>
-            Input missed {gapCount === 1 ? "once" : `${gapCount} times`} (
-            {Math.max(1, Math.round(gapDurationMs / 1000))}s not recorded)
+            {t(m.inputMissed, {
+              count: gapCount,
+              seconds: Math.max(1, Math.round(gapDurationMs / 1000)),
+            })}
           </span>
         </p>
       ) : null}
@@ -619,7 +662,7 @@ function VoiceFocusNotices({
             tone="ghost"
           >
             <Icon icon={Mic01Icon} size={14} />
-            Reconnect microphone
+            {t(m.reconnectMicrophone)}
           </Button>
         </div>
       ) : null}
@@ -648,6 +691,10 @@ function speakerColor(label: string) {
 }
 
 function VoiceFocusTranscriptRow({ item }: { item: VoiceTranscriptItem }) {
+  const t = useT();
+  // The client names an unnamed speaker "Speaker N"; the number is kept.
+  const number = item.speakerLabel?.match(/^Speaker (\d+)$/)?.[1];
+  const speaker = number ? t(m.speaker, { number }) : item.speakerLabel;
   // Town message rows: a 13px name line over 14px body text, starting
   // straight with the speaker.
   return (
@@ -656,7 +703,7 @@ function VoiceFocusTranscriptRow({ item }: { item: VoiceTranscriptItem }) {
         <span
           className={`text-[14px] leading-[18px] font-medium ${speakerColor(item.speakerLabel)}`}
         >
-          {item.speakerLabel}
+          {speaker}
         </span>
       ) : null}
       <p className="m-0 text-sm leading-5 text-app-body">{item.text}</p>
@@ -665,24 +712,24 @@ function VoiceFocusTranscriptRow({ item }: { item: VoiceTranscriptItem }) {
 }
 
 function focusTitle(captureStatus: VoiceCaptureState["status"]) {
-  if (captureStatus === "failed") return "Recording save failed";
-  if (captureStatus === "recovering")
-    return "Recording saved; recovering transcript";
-  if (captureStatus === "finalizing") return "Saving recording...";
-  return listeningTitle;
+  if (captureStatus === "failed") return m.titleSaveFailed;
+  if (captureStatus === "recovering") return m.titleRecovering;
+  if (captureStatus === "finalizing") return m.titleSaving;
+  return m.titleListening;
 }
 
-function focusSubtitle(captureStatus: VoiceCaptureState["status"]) {
-  if (captureStatus === "failed")
-    return "Received transcript segments remain available here.";
-  if (captureStatus === "recovering")
-    return "The microphone can be disconnected; recovery will continue in the background.";
-  if (captureStatus === "finalizing")
-    return "Finishing the transcript and audio file.";
+function focusSubtitle(
+  captureStatus: VoiceCaptureState["status"],
+): Message<string> | undefined {
+  if (captureStatus === "failed") return m.subtitleSaveFailed;
+  if (captureStatus === "recovering") return m.subtitleRecovering;
+  if (captureStatus === "finalizing") return m.subtitleSaving;
   return undefined;
 }
 
-function captureFailureDescription(reason: unknown): string {
+// The server's failure codes are worded here in English until they are
+// translated with the other server-sent text; the client's own fallback is not.
+function captureFailureDescription(reason: unknown, t: Translate): string {
   const message =
     reason instanceof Error
       ? reason.message
@@ -700,7 +747,7 @@ function captureFailureDescription(reason: unknown): string {
     case "Voice Capture failed":
     case undefined:
     case "":
-      return "The recording could not be saved.";
+      return t(m.saveFailed);
     default:
       return message;
   }
