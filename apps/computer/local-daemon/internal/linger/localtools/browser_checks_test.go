@@ -58,7 +58,7 @@ func TestBrowserChecksRejectUnknownFieldsAndBadRegex(t *testing.T) {
 
 func TestBrowserChecksEvaluateSnapshotAndDiff(t *testing.T) {
 	observation := browserSnapshotObservation(t, "- main [ref=e1]:\n  - button \"Pay\" [ref=e2]\n  - textbox \"Email\" [ref=e3]:\n    - text: a@b.com")
-	diff := browserStepDiff("browser_click", observation, observation)
+	diff := browserStepDiff(observation, observation)
 	checks, err := parseBrowserChecks(json.RawMessage(`[
 		{"name":"url","read":"url","op":"contains","expected":"/cart"},
 		{"name":"pay","read":"text","op":"contains","expected":"Pay"},
@@ -100,10 +100,13 @@ func TestBrowserChecksDistinguishCountAndContains(t *testing.T) {
 }
 
 func TestBrowserStepDiffMarksPageChange(t *testing.T) {
-	after := browserSnapshotObservation(t, "- main [ref=e1]:\n  - button \"Next\" [ref=e2]")
-	diff := browserStepDiff("browser_click", browserObservation{}, after)
+	const tree = "- main [ref=e1]:\n  - button \"Next\" [ref=e2]"
+	before := browserSnapshotObservation(t, tree)
+	observations := browserObservations{latest: before}
+	observations.observeAction("browser_navigate", nil, browserResult(t, snapshotPage(before.url, "Cart", tree)), "", false)
+	diff := browserStepDiff(before, observations.latest)
 	if !diff.pageChanged {
-		t.Fatal("a first page read was not marked as a page change")
+		t.Fatal("a navigation to the same address must change the page")
 	}
 	if !diff.meaningful() {
 		t.Fatal("a page change was not meaningful")
@@ -113,7 +116,7 @@ func TestBrowserStepDiffMarksPageChange(t *testing.T) {
 func TestBrowserChecksKeepContextForTextChanges(t *testing.T) {
 	before := browserSnapshotObservation(t, "- main [ref=e1]:\n  - textbox \"Email\" [ref=e2]:\n    - text: a@b.com")
 	after := browserSnapshotObservation(t, "- main [ref=e1]:\n  - textbox \"Email\" [ref=e2]:\n    - text: c@d.com")
-	diff := browserStepDiff("browser_type", before, after)
+	diff := browserStepDiff(before, after)
 	if diff.tree.rows == 0 {
 		t.Fatal("a value change produced no tree rows")
 	}

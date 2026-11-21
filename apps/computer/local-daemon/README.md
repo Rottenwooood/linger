@@ -424,9 +424,11 @@ are replaced.
 
 `ui.browser.run_steps({steps?, workflow?, save?, params?, start_step?})` runs
 planned browser actions. Each step is `{tool, args?, checkpoint?, wait_ms?}`.
-Checkpoints use a fresh page observation. Element diff checks compare refs on
-the same page and report an unavailable assertion when the snapshots cannot be
-compared. A checkpoint can poll for `wait_ms` without replaying the action.
+Checkpoints use a fresh page observation. Diff checks require full observations
+before and after the step. Begin with an unscoped `browser_snapshot` step when
+the page has yet to be observed. Element diffs also need comparable refs on the
+same page. Missing evidence produces an unavailable assertion. A checkpoint can
+poll for `wait_ms` without replaying the action.
 
 Read `result.structuredContent.status` and each step's `action_outcome`.
 `fail`, `ambiguous`, and execution errors stop the remaining steps. Only an
@@ -437,7 +439,10 @@ first step to run.
 `save` stores the steps in `.linger/browser-workflows/<name>.json`. Pass
 `workflow` without `steps` to load them. `params` fills `$NAME` placeholders.
 The Daemon resolves the steps and parameters before permission review and
-executes that same plan.
+executes that same plan. Each template's saves and run statistics are serialized
+across processes. The 1 MiB file limit includes version and run metadata.
+The Daemon rejects an oversized save before running the plan and preserves the
+existing template.
 
 A Codex Context home receives the public entry as a URL server in its projected
 `config.toml`, together with `mcp_oauth_credentials_store = "file"`. Codex

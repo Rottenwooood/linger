@@ -36,6 +36,7 @@ type browserObservationDiff struct {
 	tree         browserTreeDiff
 	elements     *browserElementChanges
 	treeChanged  bool
+	hasBaseline  bool
 	completeRead bool
 	pageChanged  bool
 	titleChanged bool
@@ -200,15 +201,16 @@ func compareObservation(before, current browserObservation) browserObservationDi
 	return diff
 }
 
-// browserStepDiff keeps assertion data independent of the compact display.
-// A snapshot step establishes a baseline and has no changes of its own.
-func browserStepDiff(tool string, before, after browserObservation) browserObservationDiff {
-	if tool == "browser_snapshot" {
-		return browserObservationDiff{completeRead: true, elements: &browserElementChanges{}}
+// browserStepDiff compares only observations that actually bracket the step.
+// Without a baseline, an empty diff cannot establish that nothing changed.
+func browserStepDiff(before, after browserObservation) browserObservationDiff {
+	if !before.snapshotFresh || !after.snapshotFresh {
+		return browserObservationDiff{}
 	}
 	diff := compareObservation(before, after)
+	diff.hasBaseline = true
 	diff.pageChanged = before.pageRevision != after.pageRevision || before.url != after.url || before.activeTab != after.activeTab
-	diff.completeRead = before.snapshotFresh && after.snapshotFresh && before.snapshot != nil && after.snapshot != nil
+	diff.completeRead = before.snapshot != nil && after.snapshot != nil
 	if !diff.completeRead || diff.pageChanged {
 		return diff
 	}

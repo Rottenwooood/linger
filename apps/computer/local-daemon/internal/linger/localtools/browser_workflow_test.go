@@ -61,7 +61,7 @@ func TestBrowserWorkflowPrepareSubstitutesAndSaves(t *testing.T) {
 	if len(prepared.Steps[1].Checks) != 1 {
 		t.Fatalf("checkpoint was not parsed: %+v", prepared.Steps[1].Checks)
 	}
-	version, err := saveBrowserWorkflow(workspace, prepared.Name, prepared.RawSteps, prepared.Parameters, true)
+	version, err := saveBrowserWorkflow(t.Context(), workspace, prepared.Name, prepared.RawSteps, prepared.Parameters)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,8 +89,10 @@ func TestBrowserWorkflowPrepareSubstitutesAndSaves(t *testing.T) {
 	if resumed.Start != 2 {
 		t.Fatalf("start=%d", resumed.Start)
 	}
-	recordBrowserWorkflowRun(workspace, "checkout", version, "pass")
-	version, err = saveBrowserWorkflow(workspace, "checkout", prepared.RawSteps, prepared.Parameters, true)
+	if err := recordBrowserWorkflowRun(t.Context(), workspace, "checkout", version, "pass"); err != nil {
+		t.Fatal(err)
+	}
+	version, err = saveBrowserWorkflow(t.Context(), workspace, "checkout", prepared.RawSteps, prepared.Parameters)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +121,7 @@ func TestBrowserWorkflowExecutesTheResolvedPlanFromReview(t *testing.T) {
 	workspace := t.TempDir()
 	original := []browserWorkflowStep{{Tool: "browser_navigate", Args: map[string]any{"url": "$URL"}}}
 	const approvedURL = "https://shop.example/approved"
-	if _, err := saveBrowserWorkflow(workspace, "checkout", original, nil, true); err != nil {
+	if _, err := saveBrowserWorkflow(t.Context(), workspace, "checkout", original, nil); err != nil {
 		t.Fatal(err)
 	}
 	op := &operation{spec: provider.OperationSpec{WorkingDirectory: workspace}}
@@ -134,7 +136,7 @@ func TestBrowserWorkflowExecutesTheResolvedPlanFromReview(t *testing.T) {
 			t.Fatalf("review did not receive the resolved plan: %s", input)
 		}
 		updated := []browserWorkflowStep{{Tool: "browser_navigate", Args: map[string]any{"url": "https://shop.example/next"}}}
-		_, err := saveBrowserWorkflow(workspace, "checkout", updated, nil, true)
+		_, err := saveBrowserWorkflow(t.Context(), workspace, "checkout", updated, nil)
 		return err
 	}
 	plan, err := op.prepareReviewedBrowserWorkflow(t.Context(), json.RawMessage(`{"workflow":"checkout","params":{"URL":"`+approvedURL+`"}}`))
@@ -152,7 +154,9 @@ func TestBrowserWorkflowExecutesTheResolvedPlanFromReview(t *testing.T) {
 	if err != nil || report.Version != 1 || report.Status != "pass" || reviews != 1 || calls != 1 {
 		t.Fatalf("approved workflow: %+v, %v, reviews=%d calls=%d", report, err, reviews, calls)
 	}
-	recordBrowserWorkflowRun(workspace, plan.Name, plan.Version, report.Status)
+	if err := recordBrowserWorkflowRun(t.Context(), workspace, plan.Name, plan.Version, report.Status); err != nil {
+		t.Fatal(err)
+	}
 	file, err := readBrowserWorkflowFile(workspace, plan.Name)
 	if err != nil || file.Version != 2 || file.Stats.SuccessCount != 0 {
 		t.Fatalf("the newer template was changed by the old run: %+v, %v", file, err)
@@ -190,6 +194,8 @@ func TestBrowserWorkflowPassAmbiguousAndFail(t *testing.T) {
 	ambiguous := &workflowCall{t: t, results: map[string][]string{
 		"browser_click": {snapshotPage("https://shop.example/cart", "Cart", tree)},
 	}}
+	before := browserResult(t, snapshotPage("https://shop.example/checkout", "Checkout", tree))
+	ambiguous.observations.observeAction("browser_snapshot", nil, before, "", false)
 	report, err = runBrowserWorkflow(t.Context(), browserPreparedWorkflow{
 		Start: 1,
 		Steps: []browserWorkflowStep{{ID: "pay", Tool: "browser_click", Args: map[string]any{"target": "e2"}, Checks: failChecks}},
@@ -285,7 +291,7 @@ func TestBrowserWorkflowDiffAssertionsUseAllChangedRefs(t *testing.T) {
 	after.WriteString(billing + "\n    - link \"Continue\" [ref=e6]:\n      - /url: /checkout")
 	before := browserSnapshotObservation(t, tree+billing)
 	current := browserSnapshotObservation(t, after.String())
-	diff := browserStepDiff("browser_click", before, current)
+	diff := browserStepDiff(before, current)
 	checks, err := parseBrowserChecks(json.RawMessage(fmt.Sprintf(`[
 		{"read":"diff","path":"elements.added","op":"not_contains","expected":"Continue"},
 		{"read":"diff","path":"elements.added","op":"count_eq","expected":%d}
@@ -297,9 +303,51 @@ func TestBrowserWorkflowDiffAssertionsUseAllChangedRefs(t *testing.T) {
 	if passed || unavailable || assertions[0].Passed || !assertions[1].Passed || diff.tree.rows != 0 {
 		t.Fatalf("large element diff: %+v, %s", assertions, diff.render())
 	}
-	_, unavailable, assertions = evaluateBrowserChecks(checks, current, browserStepDiff("browser_click", browserObservation{}, current))
+	_, unavailable, assertions = evaluateBrowserChecks(checks, current, browserStepDiff(browserObservation{}, current))
 	if !unavailable || assertions[0].Passed || assertions[0].Error == "" {
 		t.Fatalf("absence was inferred without a before snapshot: %+v", assertions)
+	}
+}
+
+func TestBrowserWorkflowDiffRequiresAnObservedBaseline(t *testing.T) {
+	const tree = "- main [ref=e1]:\n  - button \"Next\" [ref=e2]"
+	const address = "https://shop.example/cart"
+	page := snapshotPage(address, "Cart", tree)
+	checkpoint := json.RawMessage(`{"read":"diff","path":"tabs.removed","op":"not_exists"}`)
+	checks, err := parseBrowserChecks(checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name      string
+		before    browserObservation
+		tool      string
+		want      string
+		wantCalls int
+	}{
+		{name: "no prior read", tool: "browser_click", want: "ambiguous", wantCalls: 1},
+		{name: "first snapshot", tool: "browser_snapshot", want: "ambiguous", wantCalls: 1},
+		{name: "observed no removal", before: browserSnapshotObservation(t, tree), tool: "browser_click", want: "pass", wantCalls: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response := []string{page}
+			responses := map[string][]string{tc.tool: response}
+			responses["browser_snapshot"] = append(responses["browser_snapshot"], page)
+			calls := &workflowCall{t: t, observations: browserObservations{latest: tc.before}, results: responses}
+			plan := browserPreparedWorkflow{Steps: []browserWorkflowStep{
+				{ID: "check", Tool: tc.tool, Checks: checks},
+				{ID: "next", Tool: "browser_snapshot"},
+			}}
+			report, err := runBrowserWorkflow(t.Context(), plan, calls.call, calls.latest)
+			if err != nil || report.Status != tc.want || len(calls.calls) != tc.wantCalls {
+				t.Fatalf("report=%+v, error=%v, calls=%v", report, err, calls.calls)
+			}
+			if tc.want == "ambiguous" && (report.ResumeFrom != 0 || len(report.Assertions) != 1 ||
+				report.Assertions[0].Passed || report.Assertions[0].Error == "" ||
+				report.Steps[0].ActionOutcome != browserStepConfirmed || report.Diff != "") {
+				t.Fatalf("missing evidence was not reported: %+v", report)
+			}
+		})
 	}
 }
 
@@ -399,7 +447,7 @@ func TestBrowserAllowedAcceptsReadOnlyWorkflow(t *testing.T) {
 	if op.browserAllowed(browserRunStepsTool, saved) {
 		t.Fatal("saving a workflow was allowed without review")
 	}
-	if _, err := saveBrowserWorkflow(op.spec.WorkingDirectory, "readonly", []browserWorkflowStep{{Tool: "browser_snapshot"}}, nil, true); err != nil {
+	if _, err := saveBrowserWorkflow(t.Context(), op.spec.WorkingDirectory, "readonly", []browserWorkflowStep{{Tool: "browser_snapshot"}}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if op.browserAllowed(browserRunStepsTool, json.RawMessage(`{"workflow":"readonly"}`)) {

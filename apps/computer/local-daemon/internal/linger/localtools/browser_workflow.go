@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
+	"log/slog"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -13,16 +13,13 @@ import (
 	"time"
 
 	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/permission"
-	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/platform/privatefs"
 )
 
 const (
-	browserRunStepsTool         = "browser_run_steps"
-	browserWorkflowFileVersion  = 1
-	maxBrowserWorkflowSteps     = 20
-	maxBrowserWorkflowWaitMs    = 5000
-	browserWorkflowPoll         = 200 * time.Millisecond
-	browserWorkflowMaxFileBytes = 1 << 20
+	browserRunStepsTool      = "browser_run_steps"
+	maxBrowserWorkflowSteps  = 20
+	maxBrowserWorkflowWaitMs = 5000
+	browserWorkflowPoll      = 200 * time.Millisecond
 )
 
 var browserWorkflowName = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
@@ -35,21 +32,6 @@ type browserWorkflowStep struct {
 	Checkpoint json.RawMessage `json:"checkpoint,omitempty"`
 	WaitMs     int             `json:"wait_ms,omitempty"`
 	Checks     []browserCheck  `json:"-"`
-}
-
-type browserWorkflowFile struct {
-	SchemaVersion int                   `json:"schema_version"`
-	Workflow      string                `json:"workflow"`
-	Version       int                   `json:"version"`
-	Parameters    map[string]string     `json:"parameters,omitempty"`
-	Steps         []browserWorkflowStep `json:"steps"`
-	Stats         browserWorkflowStats  `json:"stats"`
-}
-
-type browserWorkflowStats struct {
-	SuccessCount int    `json:"success_count"`
-	FailCount    int    `json:"fail_count"`
-	LastStatus   string `json:"last_status,omitempty"`
 }
 
 type browserWorkflowRequest struct {
@@ -291,104 +273,6 @@ func substituteBrowserWorkflowValue(value any, params map[string]string) (any, e
 	}
 }
 
-func browserWorkflowPath(workspace, name string) string {
-	return filepath.Join(workspace, ".linger", "browser-workflows", name+".json")
-}
-
-func readBrowserWorkflowFile(workspace, name string) (browserWorkflowFile, error) {
-	data, err := privatefs.ReadFile(browserWorkflowPath(workspace, name), browserWorkflowMaxFileBytes)
-	if err != nil {
-		return browserWorkflowFile{}, fmt.Errorf("workflow %q was not found: %w", name, err)
-	}
-	var file browserWorkflowFile
-	if err := json.Unmarshal(data, &file); err != nil {
-		return browserWorkflowFile{}, fmt.Errorf("workflow %q is not valid JSON: %w", name, err)
-	}
-	if file.SchemaVersion != browserWorkflowFileVersion {
-		return browserWorkflowFile{}, fmt.Errorf("workflow %q has unsupported schema_version %d", name, file.SchemaVersion)
-	}
-	if file.Workflow != name {
-		return browserWorkflowFile{}, fmt.Errorf("workflow file %q names %q", name, file.Workflow)
-	}
-	if file.Version < 1 {
-		file.Version = 1
-	}
-	if len(file.Steps) == 0 {
-		return browserWorkflowFile{}, fmt.Errorf("workflow %q has no steps", name)
-	}
-	return file, nil
-}
-
-func saveBrowserWorkflow(workspace, name string, steps []browserWorkflowStep, parameters map[string]string, save bool) (int, error) {
-	if !save {
-		return 0, nil
-	}
-	path := browserWorkflowPath(workspace, name)
-	version := 1
-	stats := browserWorkflowStats{}
-	if data, err := privatefs.ReadFile(path, browserWorkflowMaxFileBytes); err == nil {
-		var existing browserWorkflowFile
-		if err := json.Unmarshal(data, &existing); err != nil {
-			return 0, fmt.Errorf("workflow %q is not valid JSON: %w", name, err)
-		}
-		if existing.SchemaVersion != browserWorkflowFileVersion || existing.Workflow != name {
-			return 0, fmt.Errorf("workflow %q has an incompatible saved file", name)
-		}
-		if existing.Version < 1 {
-			existing.Version = 1
-		}
-		version, stats = existing.Version+1, existing.Stats
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return 0, fmt.Errorf("workflow %q cannot be read: %w", name, err)
-	}
-	if parameters == nil {
-		parameters = map[string]string{}
-	}
-	file := browserWorkflowFile{
-		SchemaVersion: browserWorkflowFileVersion,
-		Workflow:      name,
-		Version:       version,
-		Parameters:    parameters,
-		Steps:         steps,
-		Stats:         stats,
-	}
-	data, err := json.MarshalIndent(file, "", "  ")
-	if err != nil {
-		return 0, err
-	}
-	if err := privatefs.EnsureDir(filepath.Dir(path)); err != nil {
-		return 0, err
-	}
-	if err := privatefs.WriteFile(path, append(data, '\n'), false); err != nil {
-		return 0, err
-	}
-	return version, nil
-}
-
-func recordBrowserWorkflowRun(workspace, name string, version int, status string) {
-	path := browserWorkflowPath(workspace, name)
-	data, err := privatefs.ReadFile(path, browserWorkflowMaxFileBytes)
-	if err != nil {
-		return
-	}
-	var file browserWorkflowFile
-	if json.Unmarshal(data, &file) != nil || file.SchemaVersion != browserWorkflowFileVersion ||
-		file.Workflow != name || max(file.Version, 1) != version {
-		return
-	}
-	if status == "pass" {
-		file.Stats.SuccessCount++
-	} else {
-		file.Stats.FailCount++
-	}
-	file.Stats.LastStatus = status
-	encoded, err := json.MarshalIndent(file, "", "  ")
-	if err != nil {
-		return
-	}
-	_ = privatefs.WriteFile(path, append(encoded, '\n'), false)
-}
-
 func (op *operation) prepareReviewedBrowserWorkflow(ctx context.Context, raw json.RawMessage) (browserPreparedWorkflow, error) {
 	if op.reviewWorkflow == nil {
 		return browserPreparedWorkflow{}, fmt.Errorf("%w: browser workflow review is unavailable", errNotSent)
@@ -428,7 +312,9 @@ func (op *operation) runBrowserSteps(ctx context.Context, prepared browserPrepar
 		}
 	}
 	if prepared.Save {
-		version, err := saveBrowserWorkflow(op.spec.WorkingDirectory, prepared.Name, prepared.RawSteps, prepared.Parameters, true)
+		wait, stop := schedulingContext(ctx)
+		version, err := saveBrowserWorkflow(wait, op.spec.WorkingDirectory, prepared.Name, prepared.RawSteps, prepared.Parameters)
+		stop()
 		if err != nil {
 			return browserWorkflowReport{}, fmt.Errorf("%w: %w", errNotSent, err)
 		}
@@ -437,19 +323,17 @@ func (op *operation) runBrowserSteps(ctx context.Context, prepared browserPrepar
 	report, runErr := runBrowserWorkflow(ctx, prepared, op.requestBrowser, func() browserObservation {
 		return op.browserObservations.latest
 	})
+	status := report.Status
 	if runErr != nil {
-		if errors.Is(runErr, errOutcomeUnknown) {
-			*confirmed = false
-		}
-		if prepared.Name != "" {
-			recordBrowserWorkflowRun(op.spec.WorkingDirectory, prepared.Name, prepared.Version, "error")
-		}
-		return report, runErr
+		*confirmed = !errors.Is(runErr, errOutcomeUnknown)
+		status = "error"
 	}
 	if prepared.Name != "" {
-		recordBrowserWorkflowRun(op.spec.WorkingDirectory, prepared.Name, prepared.Version, report.Status)
+		if err := recordBrowserWorkflowRun(ctx, op.spec.WorkingDirectory, prepared.Name, prepared.Version, status); err != nil {
+			slog.Warn("browser.workflow_stats_update_failed", "workflow", prepared.Name, "version", prepared.Version, "error", err)
+		}
 	}
-	return report, nil
+	return report, runErr
 }
 
 func runBrowserWorkflow(ctx context.Context, prepared browserPreparedWorkflow, call func(context.Context, string, json.RawMessage) (json.RawMessage, error), latest func() browserObservation) (browserWorkflowReport, error) {
@@ -502,7 +386,10 @@ func runBrowserWorkflow(ctx context.Context, prepared browserPreparedWorkflow, c
 					report.Diff = checkpoint.diff.render()
 				}
 				status := "fail"
-				if checkpoint.unavailable || checkpoint.diff.meaningful() {
+				// An action without a baseline may have changed the page even
+				// when its postcondition is known to be false.
+				if checkpoint.unavailable || checkpoint.diff.meaningful() ||
+					!checkpoint.diff.hasBaseline && step.Tool != "browser_snapshot" {
 					status = "ambiguous"
 				}
 				return report.stop(receipt, status, ""), nil
@@ -547,7 +434,7 @@ func checkBrowserWorkflowStep(ctx context.Context, step browserWorkflowStep, bef
 			checkpoint.result = read
 			after = latest()
 		}
-		checkpoint.diff = browserStepDiff(step.Tool, before, after)
+		checkpoint.diff = browserStepDiff(before, after)
 		checkpoint.passed, checkpoint.unavailable, checkpoint.assertions = evaluateBrowserChecks(step.Checks, after, checkpoint.diff)
 		remaining := time.Until(deadline)
 		if checkpoint.passed || remaining < browserWorkflowPoll {

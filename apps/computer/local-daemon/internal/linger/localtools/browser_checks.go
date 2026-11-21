@@ -513,11 +513,14 @@ func (s *browserSnapshot) findNode(ref string) *browserSnapshotNode {
 }
 
 func readBrowserDiff(check browserCheck, diff browserObservationDiff) (browserCheckActual, error) {
+	if !diff.hasBaseline {
+		return browserCheckActual{}, fmt.Errorf("check %q needs a full page observation before and after the step", check.Name)
+	}
 	switch check.Path {
 	case "meaningful":
 		changed := diff.meaningful()
 		if !changed && !diff.completeRead {
-			return browserCheckActual{}, fmt.Errorf("check %q needs observations before and after the step", check.Name)
+			return browserCheckActual{}, fmt.Errorf("check %q needs readable snapshots to establish that nothing changed", check.Name)
 		}
 		return browserCheckActual{Value: changed, Text: strconv.FormatBool(changed), Count: boolCount(changed), Exists: changed}, nil
 	case "page.changed":
