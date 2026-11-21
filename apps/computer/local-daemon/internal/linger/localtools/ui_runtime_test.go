@@ -47,12 +47,17 @@ func newUIRuntimeFixture(t *testing.T, required bool, callback func(context.Cont
 		{Name: "browser_snapshot", InputSchema: schema(map[string]any{})},
 		{Name: "browser_click", InputSchema: schema(map[string]any{})},
 		{Name: "browser_take_screenshot", InputSchema: schema(map[string]any{})},
+		browserRunStepsToolDefinition(),
 	}
 	original, err := openToolServer(t.Context(), identity, methods, callback, mcpproxy.LocalToolTimeout)
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = set.AddLocal(mcpproxy.LocalBinding{Name: "browser", URL: original.url, ToolNames: []string{"browser_type", "browser_snapshot", "browser_click", "browser_take_screenshot"}, WaitReady: original.waitReady, Close: original.server.Close})
+	names := make([]string, 0, len(methods))
+	for _, method := range methods {
+		names = append(names, method.Name)
+	}
+	err = set.AddLocal(mcpproxy.LocalBinding{Name: "browser", URL: original.url, ToolNames: names, WaitReady: original.waitReady, Close: original.server.Close, BindScheduling: original.bindScheduling})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,6 +121,43 @@ func (f *uiRuntimeFixture) rpc(t *testing.T, ctx context.Context, method string,
 func (f *uiRuntimeFixture) execute(t *testing.T, code string) json.RawMessage {
 	t.Helper()
 	return f.rpc(t, t.Context(), "tools/call", map[string]any{"name": "ui_exec", "arguments": map[string]any{"code": code, "timeout_ms": 30000}})
+}
+
+func TestUnifiedUIWorkflowExposesCheckpointAndActionOutcomes(t *testing.T) {
+	f := newUIRuntimeFixture(t, false, func(ctx context.Context, name string, args json.RawMessage) (json.RawMessage, error) {
+		if name != browserRunStepsTool {
+			return nil, errors.New("expected a workflow call")
+		}
+		plan, err := prepareBrowserWorkflow(args, "")
+		if err != nil {
+			return nil, err
+		}
+		const url = "https://shop.example/cart"
+		initial := snapshotPage(url, "Cart", "- main [ref=e1]:\n  - button \"Confirm\" [ref=e2]")
+		changed := snapshotPage(url, "Cart", "- main [ref=e1]:\n  - button \"Confirm\" [ref=e2]\n  - paragraph [ref=e3]: Accepted")
+		calls := &workflowCall{t: t, results: map[string][]string{"browser_click": {changed}}}
+		calls.observations.observeAction("browser_navigate", nil, browserResult(t, initial), "", false)
+		report, err := runBrowserWorkflow(ctx, plan, calls.call, calls.latest)
+		if err != nil {
+			return nil, err
+		}
+		return browserWorkflowResult(report), nil
+	})
+	clear, err := f.set.RegisterToolReviewer(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear()
+	got := f.execute(t, `const run = await ui.browser.run_steps({steps: [
+  {tool:"browser_click", args:{target:"e2"}, checkpoint:{text_contains:"Receipt"}},
+]});
+const outcome = run.structuredContent;
+return outcome.status === "ambiguous" && outcome.failed_step_index === 1 &&
+  outcome.resume_from === undefined && outcome.steps[0].action_outcome === "confirmed" &&
+  outcome.steps[0].assertions[0].passed === false;`)
+	if !strings.Contains(string(got), `"value":true`) {
+		t.Fatalf("workflow receipt could not be used by the script: %s", got)
+	}
 }
 
 func TestUnifiedUIPageUsesActionReadbackAndRawBrowserCanCompact(t *testing.T) {

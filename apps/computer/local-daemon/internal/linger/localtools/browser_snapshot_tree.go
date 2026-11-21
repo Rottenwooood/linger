@@ -20,6 +20,8 @@ type browserSnapshot struct {
 
 type browserSnapshotNode struct {
 	ref      string
+	label    string
+	value    string
 	rows     []string
 	children []browserSnapshotNode
 }
@@ -76,7 +78,7 @@ func (s *browserSnapshot) parseChildren(sequence *yaml.Node, lines []string, nex
 		if label.Kind != yaml.ScalarNode {
 			return nil, false
 		}
-		child := browserSnapshotNode{}
+		child := browserSnapshotNode{label: label.Value}
 		childOwner := owner
 		if match := snapshotNodeRef.FindStringSubmatch(label.Value); match != nil {
 			child.ref = match[1]
@@ -87,17 +89,63 @@ func (s *browserSnapshot) parseChildren(sequence *yaml.Node, lines []string, nex
 			s.order = append(s.order, child.ref)
 			childOwner = child.ref
 		}
-		if value != nil && value.Kind != yaml.ScalarNode {
-			var ok bool
-			child.children, ok = s.parseChildren(value, lines, next, childOwner)
-			if !ok {
-				return nil, false
+		if value != nil {
+			if value.Kind == yaml.ScalarNode {
+				if value.Tag != "!!null" {
+					child.value = value.Value
+				}
+			} else {
+				var ok bool
+				child.children, ok = s.parseChildren(value, lines, next, childOwner)
+				if !ok {
+					return nil, false
+				}
 			}
 		}
 		child.rows = lines[first:*next]
 		children = append(children, child)
 	}
 	return children, true
+}
+
+// Element assertions count refs, independently of the rows the compact
+// report happens to render. Only the element's own ARIA rows are compared.
+type browserElementChanges struct {
+	added   []string
+	changed []string
+	removed []string
+}
+
+func compareBrowserElements(before, current *browserSnapshot) *browserElementChanges {
+	diff := &browserElementChanges{}
+	for _, ref := range current.order {
+		now := current.nodes[ref]
+		old := before.nodes[ref]
+		if old == nil {
+			diff.added = append(diff.added, strings.Join(now.elementRows(), "\n"))
+			continue
+		}
+		rows := now.elementRows()
+		if !slices.Equal(old.elementRows(), rows) {
+			diff.changed = append(diff.changed, strings.Join(rows, "\n"))
+		}
+	}
+	for _, ref := range before.order {
+		if current.nodes[ref] == nil {
+			diff.removed = append(diff.removed, strings.Join(before.nodes[ref].elementRows(), "\n"))
+		}
+	}
+	return diff
+}
+
+func (n *browserSnapshotNode) elementRows() []string {
+	rows := []string{n.rows[0]}
+	for _, child := range n.children {
+		if child.ref == "" {
+			rows = append(rows, child.rows...)
+		}
+	}
+	return rows
 }
 
 // Retained refs anchor a compact diff. Without one, a same-URL load can look

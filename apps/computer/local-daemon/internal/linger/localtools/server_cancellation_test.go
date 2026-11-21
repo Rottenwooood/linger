@@ -136,7 +136,7 @@ func TestToolServerCancellationDoesNotNeedARequestSlot(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	s.calls[`"call"`] = cancel
+	s.calls[`"call"`] = localToolScheduling{cancel: cancel}
 	cancelToolRequest(t, s)
 	if ctx.Err() == nil {
 		t.Fatal("saturated server lost cancellation")

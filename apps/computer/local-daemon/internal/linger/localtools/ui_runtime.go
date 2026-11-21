@@ -271,11 +271,13 @@ func (u *uiExecution) dispatch(ctx context.Context, call uiruntime.Call) (json.R
 	receipt := uiDispatchReceipt{Server: endpoint.Name, Method: name, Status: "not_dispatched"}
 	u.receipts = append(u.receipts, receipt)
 	index := len(u.receipts) - 1
-	wait, stop := schedulingContext(ctx)
-	err = u.set.ReviewTool(wait, endpoint.Name, name, call.Arguments)
-	stop()
-	if err != nil {
-		return nil, err
+	if endpoint.Name != "browser" || name != browserRunStepsTool {
+		wait, stop := schedulingContext(ctx)
+		err = u.set.ReviewTool(wait, endpoint.Name, name, call.Arguments)
+		stop()
+		if err != nil {
+			return nil, err
+		}
 	}
 	if err = schedulingError(ctx); err != nil {
 		return nil, err
@@ -414,6 +416,12 @@ func (u *uiExecution) catalog(ctx context.Context, endpoint mcpproxy.ToolEndpoin
 
 func (u *uiExecution) rpc(ctx context.Context, endpoint mcpproxy.ToolEndpoint, method string, params any) (json.RawMessage, error) {
 	u.sequence++
+	if method == "tools/call" && endpoint.BindScheduling != nil {
+		wait, stop := schedulingContext(ctx)
+		defer stop()
+		release := endpoint.BindScheduling(wait, u.sequence)
+		defer release()
+	}
 	body, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": u.sequence, "method": method, "params": params})
 	if err != nil {
 		return nil, err

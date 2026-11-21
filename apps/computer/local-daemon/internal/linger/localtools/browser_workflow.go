@@ -62,19 +62,28 @@ type browserWorkflowRequest struct {
 }
 
 type browserPreparedWorkflow struct {
-	Name       string
-	Version    int
-	Steps      []browserWorkflowStep
-	RawSteps   []browserWorkflowStep
-	Parameters map[string]string
-	Save       bool
-	Start      int
+	Name       string                `json:"workflow,omitempty"`
+	Version    int                   `json:"version,omitempty"`
+	Steps      []browserWorkflowStep `json:"steps"`
+	RawSteps   []browserWorkflowStep `json:"-"`
+	Parameters map[string]string     `json:"-"`
+	Save       bool                  `json:"save,omitempty"`
+	Start      int                   `json:"start_step,omitempty"`
 }
+
+type reviewedBrowserWorkflowKey struct{}
+
+const (
+	browserStepConfirmed     = "confirmed"
+	browserStepNotDispatched = "not_dispatched"
+	browserStepUnverified    = "unverified"
+)
 
 type browserWorkflowStepResult struct {
 	Index            int                  `json:"index"`
 	ID               string               `json:"id"`
 	Tool             string               `json:"tool"`
+	ActionOutcome    string               `json:"action_outcome"`
 	Status           string               `json:"status"`
 	CheckpointPassed bool                 `json:"checkpoint_passed,omitempty"`
 	Assertions       []browserCheckResult `json:"assertions,omitempty"`
@@ -92,11 +101,10 @@ type browserWorkflowReport struct {
 	FailedStepIndex   int                         `json:"failed_step_index,omitempty"`
 	ResumeFrom        int                         `json:"resume_from,omitempty"`
 	Steps             []browserWorkflowStepResult `json:"steps,omitempty"`
-	Assertions        []browserCheckResult        `json:"assertions,omitempty"`
-	Diff              string                      `json:"diff,omitempty"`
-	LastResult        string                      `json:"last_result,omitempty"`
+	Assertions        []browserCheckResult        `json:"-"`
+	Diff              string                      `json:"-"`
+	LastResult        string                      `json:"-"`
 	Error             string                      `json:"error,omitempty"`
-	IsError           bool                        `json:"-"`
 }
 
 // browserRunStepsToolDefinition describes the one tool that runs a planned
@@ -108,7 +116,7 @@ func browserRunStepsToolDefinition() tool {
 			"id":         map[string]any{"type": "string"},
 			"tool":       map[string]any{"type": "string"},
 			"args":       map[string]any{"type": "object", "additionalProperties": true},
-			"checkpoint": map[string]any{"type": "object", "additionalProperties": true, "description": "A check, a list of checks, or a name-to-check object."},
+			"checkpoint": map[string]any{"type": []string{"object", "array"}, "description": "A check, a list of checks, or a name-to-check object."},
 			"wait_ms":    map[string]any{"type": "integer", "minimum": 0, "maximum": maxBrowserWorkflowWaitMs},
 		},
 		"required":             []string{"tool"},
@@ -116,7 +124,7 @@ func browserRunStepsToolDefinition() tool {
 	}
 	return tool{
 		Name:        browserRunStepsTool,
-		Description: "Run a planned sequence of browser actions. Each step may carry checkpoint checks; the call stops at the first fail or ambiguous and returns the failed step, its diff and a resume_from index. Save steps as a reusable workflow, fill $NAME parameters, and resume a saved workflow at start_step. A step tool is one of the browser tools except browser_close and browser_run_steps.",
+		Description: "Run a planned sequence of browser actions with optional checkpoints. Read structuredContent.status and the step action_outcome. Only a step known not to have been dispatched gets a resume_from index. Inspect the page before continuing after a completed or unverified action. Save reusable steps under workflow, supply $NAME parameters, and choose start_step to continue.",
 		InputSchema: schema(map[string]any{
 			"steps":      map[string]any{"type": "array", "minItems": 1, "maxItems": maxBrowserWorkflowSteps, "items": step},
 			"workflow":   map[string]any{"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$", "maxLength": 64},
@@ -128,9 +136,8 @@ func browserRunStepsToolDefinition() tool {
 	}
 }
 
-// prepareBrowserWorkflow loads, substitutes and validates a workflow without
-// writing anything. The read-only callers use it for routing and evidence;
-// the tool call saves only after the request is approved.
+// prepareBrowserWorkflow loads, substitutes and validates the plan that will
+// be reviewed and executed.
 func prepareBrowserWorkflow(raw json.RawMessage, workspace string) (browserPreparedWorkflow, error) {
 	var request browserWorkflowRequest
 	if err := json.Unmarshal(raw, &request); err != nil {
@@ -358,14 +365,15 @@ func saveBrowserWorkflow(workspace, name string, steps []browserWorkflowStep, pa
 	return version, nil
 }
 
-func recordBrowserWorkflowRun(workspace, name, status string) {
+func recordBrowserWorkflowRun(workspace, name string, version int, status string) {
 	path := browserWorkflowPath(workspace, name)
 	data, err := privatefs.ReadFile(path, browserWorkflowMaxFileBytes)
 	if err != nil {
 		return
 	}
 	var file browserWorkflowFile
-	if json.Unmarshal(data, &file) != nil {
+	if json.Unmarshal(data, &file) != nil || file.SchemaVersion != browserWorkflowFileVersion ||
+		file.Workflow != name || max(file.Version, 1) != version {
 		return
 	}
 	if status == "pass" {
@@ -381,29 +389,48 @@ func recordBrowserWorkflowRun(workspace, name, status string) {
 	_ = privatefs.WriteFile(path, append(encoded, '\n'), false)
 }
 
+func (op *operation) prepareReviewedBrowserWorkflow(ctx context.Context, raw json.RawMessage) (browserPreparedWorkflow, error) {
+	if op.reviewWorkflow == nil {
+		return browserPreparedWorkflow{}, fmt.Errorf("%w: browser workflow review is unavailable", errNotSent)
+	}
+	plan, err := prepareBrowserWorkflow(raw, op.spec.WorkingDirectory)
+	if err != nil {
+		return browserPreparedWorkflow{}, fmt.Errorf("%w: %w", errNotSent, err)
+	}
+	resolved, err := json.Marshal(plan)
+	if err != nil {
+		return browserPreparedWorkflow{}, fmt.Errorf("%w: %w", errNotSent, err)
+	}
+	wait, stop := schedulingContext(ctx)
+	defer stop()
+	if err := op.reviewWorkflow(wait, resolved); err != nil {
+		return browserPreparedWorkflow{}, fmt.Errorf("%w: %w", errNotSent, err)
+	}
+	return plan, nil
+}
+
 // runBrowserSteps executes one browser_run_steps call under the browser call
 // hold and journal that nativeBrowserCall already acquired.
-func (op *operation) runBrowserSteps(ctx context.Context, raw json.RawMessage, confirmed *bool) (json.RawMessage, error) {
+func (op *operation) runBrowserSteps(ctx context.Context, prepared browserPreparedWorkflow, confirmed *bool) (browserWorkflowReport, error) {
 	*confirmed = true
-	prepared, err := prepareBrowserWorkflow(raw, op.spec.WorkingDirectory)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", errNotSent, err)
+	if err := schedulingError(ctx); err != nil {
+		return browserWorkflowReport{}, fmt.Errorf("%w: %w", errNotSent, err)
 	}
 	if err := op.refuseBrowserWorkflow(prepared); err != nil {
-		return nil, fmt.Errorf("%w: %w", errNotSent, err)
+		return browserWorkflowReport{}, fmt.Errorf("%w: %w", errNotSent, err)
 	}
 	if op.userChromeSession != nil {
 		for index := browserWorkflowStart(prepared) - 1; index < len(prepared.Steps); index++ {
 			step := prepared.Steps[index]
 			if err := op.userChromeFileUploadRefused(step.Tool, step.Args); err != nil {
-				return nil, err
+				return browserWorkflowReport{}, err
 			}
 		}
 	}
 	if prepared.Save {
 		version, err := saveBrowserWorkflow(op.spec.WorkingDirectory, prepared.Name, prepared.RawSteps, prepared.Parameters, true)
 		if err != nil {
-			return nil, fmt.Errorf("%w: %w", errNotSent, err)
+			return browserWorkflowReport{}, fmt.Errorf("%w: %w", errNotSent, err)
 		}
 		prepared.Version = version
 	}
@@ -411,121 +438,137 @@ func (op *operation) runBrowserSteps(ctx context.Context, raw json.RawMessage, c
 		return op.browserObservations.latest
 	})
 	if runErr != nil {
-		if errors.Is(runErr, errOutcomeUnknown) || ctx.Err() != nil {
+		if errors.Is(runErr, errOutcomeUnknown) {
 			*confirmed = false
 		}
 		if prepared.Name != "" {
-			recordBrowserWorkflowRun(op.spec.WorkingDirectory, prepared.Name, "error")
+			recordBrowserWorkflowRun(op.spec.WorkingDirectory, prepared.Name, prepared.Version, "error")
 		}
-		return nil, runErr
+		return report, runErr
 	}
 	if prepared.Name != "" {
-		recordBrowserWorkflowRun(op.spec.WorkingDirectory, prepared.Name, report.Status)
+		recordBrowserWorkflowRun(op.spec.WorkingDirectory, prepared.Name, prepared.Version, report.Status)
 	}
-	return browserWorkflowResult(report), nil
+	return report, nil
 }
 
 func runBrowserWorkflow(ctx context.Context, prepared browserPreparedWorkflow, call func(context.Context, string, json.RawMessage) (json.RawMessage, error), latest func() browserObservation) (browserWorkflowReport, error) {
 	report := browserWorkflowReport{
-		Status:     "pass",
-		Workflow:   prepared.Name,
-		Version:    prepared.Version,
-		StepsTotal: len(prepared.Steps),
+		Status: "pass", Workflow: prepared.Name, Version: prepared.Version, StepsTotal: len(prepared.Steps),
 	}
 	for index := browserWorkflowStart(prepared) - 1; index < len(prepared.Steps); index++ {
 		step := prepared.Steps[index]
+		receipt := browserWorkflowStepResult{
+			Index: index + 1, ID: step.ID, Tool: step.Tool, ActionOutcome: browserStepNotDispatched,
+		}
 		args, err := json.Marshal(step.Args)
 		if err != nil {
-			report.Status, report.IsError, report.Error = "error", true, err.Error()
-			report.FailedStep, report.FailedStepIndex, report.ResumeFrom = step.ID, index+1, index+1
-			report.Steps = append(report.Steps, browserWorkflowStepResult{Index: index + 1, ID: step.ID, Tool: step.Tool, Status: "error", Error: err.Error()})
-			return report, nil //nolint:nilerr // the report carries the marshal error
+			return report.stop(receipt, "error", err.Error()), nil
+		}
+		if err := schedulingError(ctx); err != nil {
+			return report.stop(receipt, "error", err.Error()), nil
 		}
 		before := latest()
 		result, err := call(ctx, step.Tool, args)
 		if err != nil {
-			if errors.Is(err, errOutcomeUnknown) || ctx.Err() != nil {
+			if errors.Is(err, errOutcomeUnknown) {
 				return report, err
 			}
-			return failedBrowserWorkflow(report, step, index, result, "error", err.Error())
-		}
-		if toolErr := toolResultError(result); toolErr != nil {
-			return failedBrowserWorkflow(report, step, index, result, "error", toolErr.Error())
-		}
-		lastResult := result
-		after := latest()
-		diff := browserStepDiff(step.Tool, before, after)
-		allPassed, checkError, checks := evaluateBrowserChecks(step.Checks, after, diff)
-		if checkError {
-			report, _ = failedBrowserWorkflow(report, step, index, result, "error", "a checkpoint could not be evaluated")
-			report.Assertions = checks
-			report.Steps[len(report.Steps)-1].Assertions = checks
-			return report, nil
-		}
-		if len(step.Checks) > 0 && !allPassed && step.WaitMs > 0 {
-			deadline := time.Now().Add(time.Duration(step.WaitMs) * time.Millisecond)
-			for !allPassed && time.Now().Before(deadline) {
-				if err := sleepContext(ctx, browserWorkflowPoll); err != nil {
-					return failedBrowserWorkflow(report, step, index, lastResult, "error", err.Error())
-				}
-				refresh, err := call(ctx, "browser_snapshot", json.RawMessage(`{}`))
-				if err != nil {
-					if errors.Is(err, errOutcomeUnknown) || ctx.Err() != nil {
-						return report, err
-					}
-					return failedBrowserWorkflow(report, step, index, lastResult, "error", err.Error())
-				}
-				if toolErr := toolResultError(refresh); toolErr != nil {
-					return failedBrowserWorkflow(report, step, index, lastResult, "error", toolErr.Error())
-				}
-				lastResult = refresh
-				after = latest()
-				diff = browserStepDiff(step.Tool, before, after)
-				allPassed, checkError, checks = evaluateBrowserChecks(step.Checks, after, diff)
-				if checkError {
-					report, _ = failedBrowserWorkflow(report, step, index, lastResult, "error", "a checkpoint could not be evaluated")
-					report.Assertions = checks
-					report.Steps[len(report.Steps)-1].Assertions = checks
-					return report, nil
-				}
+			if !errors.Is(err, errNotSent) {
+				receipt.ActionOutcome = browserStepUnverified
 			}
+			return report.stop(receipt, "error", err.Error()), nil
 		}
-		stepResult := browserWorkflowStepResult{Index: index + 1, ID: step.ID, Tool: step.Tool, Assertions: checks}
+		report.LastResult = browserWorkflowResultText(result)
+		if err := toolResultError(result); err != nil {
+			receipt.ActionOutcome = browserStepUnverified
+			return report.stop(receipt, "error", err.Error()), nil
+		}
+
+		receipt.ActionOutcome = browserStepConfirmed
 		if len(step.Checks) > 0 {
-			stepResult.CheckpointPassed = allPassed
-			if allPassed {
-				report.CheckpointsPassed++
+			checkpoint, err := checkBrowserWorkflowStep(ctx, step, before, result, call, latest)
+			if errors.Is(err, errOutcomeUnknown) {
+				return report, err
 			}
+			report.LastResult = browserWorkflowResultText(checkpoint.result)
+			receipt.Assertions = checkpoint.assertions
+			receipt.CheckpointPassed = checkpoint.passed
+			switch {
+			case err != nil:
+				return report.stop(receipt, "ambiguous", err.Error()), nil
+			case !checkpoint.passed:
+				if checkpoint.diff.meaningful() || checkpoint.diff.completeRead {
+					report.Diff = checkpoint.diff.render()
+				}
+				status := "fail"
+				if checkpoint.unavailable || checkpoint.diff.meaningful() {
+					status = "ambiguous"
+				}
+				return report.stop(receipt, status, ""), nil
+			}
+			report.CheckpointsPassed++
 		}
-		if allPassed {
-			stepResult.Status = "pass"
-			report.StepsCompleted++
-			report.Steps = append(report.Steps, stepResult)
-			report.LastResult = browserWorkflowResultText(lastResult)
-			continue
-		}
-		if diff.meaningful() {
-			stepResult.Status = "ambiguous"
-		} else {
-			stepResult.Status = "fail"
-		}
-		report.Status = stepResult.Status
-		report.FailedStep, report.FailedStepIndex, report.ResumeFrom = step.ID, index+1, index+1
-		report.Assertions = checks
-		report.Diff = diff.render()
-		report.LastResult = browserWorkflowResultText(lastResult)
-		report.Steps = append(report.Steps, stepResult)
-		return report, nil
+		receipt.Status = "pass"
+		report.Steps = append(report.Steps, receipt)
+		report.StepsCompleted++
 	}
 	return report, nil
 }
 
-func failedBrowserWorkflow(report browserWorkflowReport, step browserWorkflowStep, index int, result json.RawMessage, status, message string) (browserWorkflowReport, error) {
-	report.Status, report.IsError, report.Error = status, true, message
-	report.FailedStep, report.FailedStepIndex, report.ResumeFrom = step.ID, index+1, index+1
-	report.Steps = append(report.Steps, browserWorkflowStepResult{Index: index + 1, ID: step.ID, Tool: step.Tool, Status: status, Error: message})
-	report.LastResult = browserWorkflowResultText(result)
-	return report, nil
+type browserWorkflowCheckpoint struct {
+	result      json.RawMessage
+	diff        browserObservationDiff
+	assertions  []browserCheckResult
+	passed      bool
+	unavailable bool
+}
+
+// A step with no full snapshot needs a fresh read before its checkpoint can
+// use the page. Polling refreshes the observation without repeating the action.
+func checkBrowserWorkflowStep(ctx context.Context, step browserWorkflowStep, before browserObservation, result json.RawMessage, call func(context.Context, string, json.RawMessage) (json.RawMessage, error), latest func() browserObservation) (browserWorkflowCheckpoint, error) {
+	checkpoint := browserWorkflowCheckpoint{result: result}
+	after := latest()
+	wait, stop := schedulingContext(ctx)
+	defer stop()
+	deadline := time.Now().Add(time.Duration(step.WaitMs) * time.Millisecond)
+	for refresh := !after.snapshotFresh; ; refresh = true {
+		if refresh {
+			if err := schedulingError(ctx); err != nil {
+				return checkpoint, err
+			}
+			read, err := call(ctx, "browser_snapshot", json.RawMessage("{}"))
+			if err != nil {
+				return checkpoint, err
+			}
+			if err := toolResultError(read); err != nil {
+				return checkpoint, err
+			}
+			checkpoint.result = read
+			after = latest()
+		}
+		checkpoint.diff = browserStepDiff(step.Tool, before, after)
+		checkpoint.passed, checkpoint.unavailable, checkpoint.assertions = evaluateBrowserChecks(step.Checks, after, checkpoint.diff)
+		remaining := time.Until(deadline)
+		if checkpoint.passed || remaining < browserWorkflowPoll {
+			return checkpoint, nil
+		}
+		if err := sleepContext(wait, browserWorkflowPoll); err != nil {
+			return checkpoint, err
+		}
+	}
+}
+
+func (report browserWorkflowReport) stop(step browserWorkflowStepResult, status, message string) browserWorkflowReport {
+	step.Status, step.Error = status, message
+	report.Status, report.Error = status, message
+	report.FailedStep, report.FailedStepIndex = step.ID, step.Index
+	if step.ActionOutcome == browserStepNotDispatched {
+		report.ResumeFrom = step.Index
+	}
+	report.Assertions = step.Assertions
+	report.Steps = append(report.Steps, step)
+	return report
 }
 
 func browserWorkflowResultText(result json.RawMessage) string {
@@ -548,18 +591,22 @@ func (report browserWorkflowReport) text() string {
 		fmt.Fprintf(&out, "- checkpoints passed: %d\n", report.CheckpointsPassed)
 	}
 	for _, step := range report.Steps {
-		fmt.Fprintf(&out, "- step %d (%s: %s): %s", step.Index, step.ID, step.Tool, step.Status)
+		fmt.Fprintf(&out, "- step %d (%s: %s): %s, action %s", step.Index, step.ID, step.Tool, step.Status, step.ActionOutcome)
 		if step.CheckpointPassed {
-			out.WriteString("; checkpoint pass")
+			out.WriteString(", checkpoint passed")
 		}
 		if step.Error != "" {
-			fmt.Fprintf(&out, "; error: %s", step.Error)
+			fmt.Fprintf(&out, ", error: %s", step.Error)
 		}
 		out.WriteString("\n")
 	}
 	if report.FailedStep != "" {
 		fmt.Fprintf(&out, "- failed step: %d (%s)\n", report.FailedStepIndex, report.FailedStep)
-		fmt.Fprintf(&out, "- resume_from: %d\n", report.ResumeFrom)
+		if report.ResumeFrom > 0 {
+			fmt.Fprintf(&out, "- resume_from: %d\n", report.ResumeFrom)
+		} else {
+			out.WriteString("- inspect the step outcome before continuing\n")
+		}
 	}
 	if report.Error != "" {
 		fmt.Fprintf(&out, "- error: %s\n", report.Error)
@@ -644,9 +691,6 @@ func browserWorkflowURL(step browserWorkflowStep) string {
 // needs, without adding fields to permission.Browser.
 func browserWorkflowEvidence(prepared browserPreparedWorkflow, pages *browserPages) *permission.Browser {
 	page, title := pages.current()
-	if page == "" {
-		return nil
-	}
 	browser := &permission.Browser{URL: page, Title: title}
 	var fields []string
 	for index, step := range prepared.Steps {
@@ -669,6 +713,9 @@ func browserWorkflowEvidence(prepared browserPreparedWorkflow, pages *browserPag
 		}
 	}
 	browser.FormFields = strings.Join(fields, "\n")
+	if page == "" && browser.FormFields == "" {
+		return nil
+	}
 	return browser
 }
 
@@ -716,8 +763,8 @@ func (op *operation) userChromeFileUploadRefused(name string, args map[string]an
 // browserWorkflowResult is the MCP result of a completed workflow.
 func browserWorkflowResult(report browserWorkflowReport) json.RawMessage {
 	encoded, _ := json.Marshal(map[string]any{
-		"content": []map[string]string{{"type": "text", "text": report.text()}},
-		"isError": report.IsError,
+		"content":           []map[string]string{{"type": "text", "text": report.text()}},
+		"structuredContent": report,
 	})
 	return encoded
 }

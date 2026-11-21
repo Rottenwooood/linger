@@ -422,12 +422,22 @@ arguments for the full page. A snapshot of a target or limited depth leaves
 the full-page baseline intact. Only links under `.linger/browser-output/`
 are replaced.
 
-`ui.browser.run_steps({steps, workflow?, save?, params?, start_step?})` runs
-planned browser actions and evaluates each step's checkpoint. A step is
-`{tool, args?, checkpoint?, wait_ms?}`. The call stops at the first `fail` or
-`ambiguous`, returns the failed step, its diff and `resume_from`, and keeps the
-page scene. `save` stores the steps in `.linger/browser-workflows/<name>.json`;
-`params` fills `$NAME` placeholders; `start_step` resumes a saved workflow.
+`ui.browser.run_steps({steps?, workflow?, save?, params?, start_step?})` runs
+planned browser actions. Each step is `{tool, args?, checkpoint?, wait_ms?}`.
+Checkpoints use a fresh page observation. Element diff checks compare refs on
+the same page and report an unavailable assertion when the snapshots cannot be
+compared. A checkpoint can poll for `wait_ms` without replaying the action.
+
+Read `result.structuredContent.status` and each step's `action_outcome`.
+`fail`, `ambiguous`, and execution errors stop the remaining steps. Only an
+action known to be undispatched produces `resume_from`. Inspect the page before
+continuing after a confirmed or unverified action. `start_step` selects the
+first step to run.
+
+`save` stores the steps in `.linger/browser-workflows/<name>.json`. Pass
+`workflow` without `steps` to load them. `params` fills `$NAME` placeholders.
+The Daemon resolves the steps and parameters before permission review and
+executes that same plan.
 
 A Codex Context home receives the public entry as a URL server in its projected
 `config.toml`, together with `mcp_oauth_credentials_store = "file"`. Codex

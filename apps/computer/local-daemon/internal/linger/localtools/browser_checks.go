@@ -26,8 +26,8 @@ type browserCheckResult struct {
 	Name     string `json:"name,omitempty"`
 	Read     string `json:"read"`
 	Op       string `json:"op"`
-	Expected any    `json:"expected,omitempty"`
-	Actual   any    `json:"actual,omitempty"`
+	Expected any    `json:"-"`
+	Actual   any    `json:"-"`
 	Passed   bool   `json:"passed"`
 	Error    string `json:"error,omitempty"`
 }
@@ -405,6 +405,9 @@ func browserValuesEqual(actual, expected any) bool {
 }
 
 func readBrowserCheck(check browserCheck, observation browserObservation, diff browserObservationDiff) (browserCheckActual, error) {
+	if !observation.snapshotFresh {
+		return browserCheckActual{}, fmt.Errorf("check %q needs a fresh page snapshot", check.Name)
+	}
 	switch check.Read {
 	case "url":
 		return browserCheckActual{Value: observation.url, Text: observation.url, Exists: observation.url != ""}, nil
@@ -485,13 +488,7 @@ func readBrowserRole(check browserCheck, snapshot *browserSnapshot) browserCheck
 }
 
 func browserNodeRoleLabel(node *browserSnapshotNode) (role, label string) {
-	if node == nil || len(node.rows) == 0 {
-		return "", ""
-	}
-	line := strings.TrimSpace(node.rows[0])
-	line = strings.TrimPrefix(line, "- ")
-	role, rest, _ := strings.Cut(line, " ")
-	role = strings.TrimSuffix(role, ":")
+	role, rest, _ := strings.Cut(node.label, " ")
 	rest = strings.TrimSpace(rest)
 	if strings.HasPrefix(rest, `"`) {
 		label, _ = quotedPrefix(rest)
@@ -500,55 +497,29 @@ func browserNodeRoleLabel(node *browserSnapshotNode) (role, label string) {
 }
 
 func browserNodeValue(node *browserSnapshotNode) string {
-	if node == nil {
-		return ""
-	}
-	for _, row := range node.rows[1:] {
-		text := strings.TrimSpace(row)
-		if !strings.HasPrefix(text, "- text: ") {
-			continue
+	for _, child := range node.children {
+		if child.label == "text" {
+			return child.value
 		}
-		value := strings.TrimPrefix(text, "- text: ")
-		if strings.HasPrefix(value, `"`) {
-			if unquoted, ok := quotedPrefix(value); ok {
-				return unquoted
-			}
-		}
-		return value
 	}
-	line := strings.TrimSpace(node.rows[0])
-	if index := strings.LastIndex(line, ": "); index >= 0 {
-		return line[index+2:]
-	}
-	return ""
+	return node.value
 }
 
 func (s *browserSnapshot) findNode(ref string) *browserSnapshotNode {
 	if s == nil {
 		return nil
 	}
-	if node := s.nodes[ref]; node != nil {
-		return node
-	}
-	var find func(*browserSnapshotNode) *browserSnapshotNode
-	find = func(node *browserSnapshotNode) *browserSnapshotNode {
-		if node.ref == ref {
-			return node
-		}
-		for i := range node.children {
-			if found := find(&node.children[i]); found != nil {
-				return found
-			}
-		}
-		return nil
-	}
-	return find(&s.root)
+	return s.nodes[ref]
 }
 
 func readBrowserDiff(check browserCheck, diff browserObservationDiff) (browserCheckActual, error) {
 	switch check.Path {
 	case "meaningful":
-		return browserCheckActual{Value: diff.meaningful(), Text: strconv.FormatBool(diff.meaningful()), Count: boolCount(diff.meaningful()), Exists: diff.meaningful()}, nil
+		changed := diff.meaningful()
+		if !changed && !diff.completeRead {
+			return browserCheckActual{}, fmt.Errorf("check %q needs observations before and after the step", check.Name)
+		}
+		return browserCheckActual{Value: changed, Text: strconv.FormatBool(changed), Count: boolCount(changed), Exists: changed}, nil
 	case "page.changed":
 		return browserCheckActual{Value: diff.pageChanged, Text: strconv.FormatBool(diff.pageChanged), Count: boolCount(diff.pageChanged), Exists: diff.pageChanged}, nil
 	case "title.changed":
@@ -567,12 +538,18 @@ func readBrowserDiff(check browserCheck, diff browserObservationDiff) (browserCh
 		return browserListActual(diff.tabsRemoved), nil
 	case "tabs.changed":
 		return browserListActual(diff.tabsChanged), nil
-	case "elements.added":
-		return browserListActual(browserTreeChangeLines(diff.tree.added)), nil
-	case "elements.changed":
-		return browserListActual(browserTreeChangeLines(diff.tree.changed)), nil
-	case "elements.removed":
-		return browserListActual(browserTreeChangeLines(diff.tree.removed)), nil
+	case "elements.added", "elements.changed", "elements.removed":
+		if diff.elements == nil {
+			return browserCheckActual{}, fmt.Errorf("check %q needs comparable snapshots of the same page", check.Name)
+		}
+		switch check.Path {
+		case "elements.added":
+			return browserListActual(diff.elements.added), nil
+		case "elements.changed":
+			return browserListActual(diff.elements.changed), nil
+		default:
+			return browserListActual(diff.elements.removed), nil
+		}
 	default:
 		return browserCheckActual{}, fmt.Errorf("check %q has unknown diff path %q", check.Name, check.Path)
 	}
@@ -588,14 +565,6 @@ func boolCount(value bool) int {
 		return 1
 	}
 	return 0
-}
-
-func browserTreeChangeLines(changes []browserTreeChange) []string {
-	var lines []string
-	for _, change := range changes {
-		lines = append(lines, change.rows...)
-	}
-	return lines
 }
 
 func compareBrowserCheck(check browserCheck, actual browserCheckActual) (bool, error) {

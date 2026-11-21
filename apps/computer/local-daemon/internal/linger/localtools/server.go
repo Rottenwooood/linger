@@ -29,8 +29,13 @@ type toolServer struct {
 	readyOnce sync.Once
 	slots     chan struct{}
 	callsMu   sync.Mutex
-	calls     map[string]context.CancelFunc
+	calls     map[string]localToolScheduling
 	timeout   time.Duration
+}
+
+type localToolScheduling struct {
+	upstream context.Context
+	cancel   context.CancelFunc
 }
 
 type localToolCall struct {
@@ -50,11 +55,31 @@ func openToolServer(ctx context.Context, identity mcpproxy.OperationIdentity, to
 	if err != nil {
 		return nil, err
 	}
-	s := &toolServer{path: "/mcp/" + rand.Text(), tools: tools, identity: identity, ctx: ctx, call: call, ready: make(chan struct{}), slots: make(chan struct{}, 16), calls: make(map[string]context.CancelFunc), timeout: timeout}
+	s := &toolServer{path: "/mcp/" + rand.Text(), tools: tools, identity: identity, ctx: ctx, call: call, ready: make(chan struct{}), slots: make(chan struct{}, 16), calls: make(map[string]localToolScheduling), timeout: timeout}
 	s.url = "http://" + listener.Addr().String() + s.path
 	s.server = &http.Server{Handler: http.HandlerFunc(s.handle), ReadHeaderTimeout: 5 * time.Second}
 	go func() { _ = s.server.Serve(listener) }()
 	return s, nil
+}
+
+// The private caller registers its scheduling context before HTTP dispatch, so
+// a cancellation during admission cannot race the driver's call registration.
+func (s *toolServer) bindScheduling(ctx context.Context, id uint64) func() {
+	key := strconv.FormatUint(id, 10)
+	s.callsMu.Lock()
+	if _, exists := s.calls[key]; exists {
+		s.callsMu.Unlock()
+		return func() {}
+	}
+	s.calls[key] = localToolScheduling{upstream: ctx}
+	s.callsMu.Unlock()
+	return func() {
+		s.callsMu.Lock()
+		defer s.callsMu.Unlock()
+		if s.calls[key].cancel == nil {
+			delete(s.calls, key)
+		}
+	}
 }
 
 func (s *toolServer) waitReady(ctx context.Context) error {
@@ -104,7 +129,7 @@ func (s *toolServer) handle(w http.ResponseWriter, r *http.Request) {
 			}
 			if json.Unmarshal(request.Params, &params) == nil {
 				s.callsMu.Lock()
-				cancel := s.calls[string(bytes.TrimSpace(params.RequestID))]
+				cancel := s.calls[string(bytes.TrimSpace(params.RequestID))].cancel
 				s.callsMu.Unlock()
 				if cancel != nil {
 					cancel()
@@ -177,14 +202,22 @@ func (s *toolServer) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		key := string(bytes.TrimSpace(request.ID))
 		s.callsMu.Lock()
-		if _, duplicate := s.calls[key]; duplicate {
+		registered := s.calls[key]
+		if registered.cancel != nil {
 			s.callsMu.Unlock()
 			err = errors.New("Local tool request ID is already active")
 			break
 		}
-		s.calls[key] = stopScheduling
+		s.calls[key] = localToolScheduling{cancel: stopScheduling}
 		s.callsMu.Unlock()
 		defer func() { s.callsMu.Lock(); delete(s.calls, key); s.callsMu.Unlock() }()
+		if registered.upstream != nil {
+			stopUpstream := context.AfterFunc(registered.upstream, stopScheduling)
+			defer stopUpstream()
+			if registered.upstream.Err() != nil {
+				stopScheduling()
+			}
+		}
 		ctx = context.WithValue(ctx, toolSchedulingKey{}, scheduling)
 		if params.Metadata != nil && params.Metadata.FullBrowserSnapshot {
 			ctx = context.WithValue(ctx, fullBrowserSnapshotKey{}, true)

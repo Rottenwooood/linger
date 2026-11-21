@@ -325,15 +325,6 @@ func (op *operation) refuseOtherBrowserOnChromeSite(urls []string) error {
 // the browser tools drive Chrome through its debugging protocol, which such
 // sites detect. Every other site stays open to the browser tools.
 func (op *operation) refuseBrowserOnChromeSite(name string, args json.RawMessage) error {
-	if name == browserRunStepsTool {
-		prepared, err := prepareBrowserWorkflow(args, op.spec.WorkingDirectory)
-		if err != nil {
-			// The workflow itself will be refused before it sends a command;
-			// no address can be checked without a valid step list.
-			return nil //nolint:nilerr // an invalid workflow cannot open a site
-		}
-		return op.refuseBrowserWorkflow(prepared)
-	}
 	if name != "browser_navigate" && name != "browser_tabs" {
 		return nil
 	}
@@ -346,9 +337,7 @@ func (op *operation) refuseBrowserOnChromeSite(name string, args json.RawMessage
 	return op.refuseBrowserAddress(params.URL, name)
 }
 
-// refuseBrowserWorkflow checks every remaining step address. The tool call
-// runs it again after loading a saved workflow, so a file changed between the
-// review and the call cannot open a site this task keeps out of the browser.
+// refuseBrowserWorkflow checks the approved addresses against current site policy.
 func (op *operation) refuseBrowserWorkflow(prepared browserPreparedWorkflow) error {
 	for index := browserWorkflowStart(prepared) - 1; index < len(prepared.Steps); index++ {
 		step := prepared.Steps[index]

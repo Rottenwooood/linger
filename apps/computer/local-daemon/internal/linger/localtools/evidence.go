@@ -54,10 +54,9 @@ func (op *operation) guard(collect func(context.Context, string, json.RawMessage
 // made only of read-only steps and such navigations.
 func (op *operation) browserAllowed(name string, input json.RawMessage) bool {
 	if name == browserRunStepsTool {
-		prepared, err := prepareBrowserWorkflow(input, op.spec.WorkingDirectory)
-		if err != nil || prepared.Save || prepared.Name != "" {
-			// A saved workflow can change between the review and the call;
-			// review it every time. Inline steps are fixed by this request.
+		var prepared browserPreparedWorkflow
+		if json.Unmarshal(input, &prepared) != nil || prepared.Save || prepared.Name != "" ||
+			len(prepared.Steps) == 0 || prepared.Start < 0 || prepared.Start > len(prepared.Steps) {
 			return false
 		}
 		for index := browserWorkflowStart(prepared) - 1; index < len(prepared.Steps); index++ {
@@ -86,8 +85,8 @@ func (op *operation) browserAllowed(name string, input json.RawMessage) bool {
 // snapshot: element references stay as the Agent saw them.
 func (op *operation) browserEvidence(ctx context.Context, name string, input json.RawMessage) *permission.Evidence {
 	if name == browserRunStepsTool {
-		prepared, err := prepareBrowserWorkflow(input, op.spec.WorkingDirectory)
-		if err != nil {
+		var prepared browserPreparedWorkflow
+		if json.Unmarshal(input, &prepared) != nil {
 			return nil
 		}
 		browser := browserWorkflowEvidence(prepared, &op.pages)

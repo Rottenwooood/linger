@@ -19,18 +19,24 @@ type browserObservations struct {
 
 // browserObservation is the last complete page read and its browser state.
 type browserObservation struct {
-	snapshot  *browserSnapshot
-	url       string
-	title     string
-	status    string
-	console   string
-	tabs      map[string]string
-	activeTab string
-	downloads map[string]bool
+	snapshot      *browserSnapshot
+	snapshotFresh bool
+	pageRevision  uint64
+	hasPageHeader bool
+	url           string
+	title         string
+	status        string
+	console       string
+	tabs          map[string]string
+	activeTab     string
+	downloads     map[string]bool
 }
 
 type browserObservationDiff struct {
 	tree         browserTreeDiff
+	elements     *browserElementChanges
+	treeChanged  bool
+	completeRead bool
 	pageChanged  bool
 	titleChanged bool
 	fromTitle    string
@@ -44,7 +50,7 @@ type browserObservationDiff struct {
 }
 
 func (d browserObservationDiff) meaningful() bool {
-	return d.pageChanged || d.titleChanged || d.statusLine != "" || d.consoleLine != "" ||
+	return d.pageChanged || d.treeChanged || d.titleChanged || d.statusLine != "" || d.consoleLine != "" ||
 		len(d.tabsAdded) > 0 || len(d.tabsRemoved) > 0 || len(d.tabsChanged) > 0 ||
 		len(d.downloads) > 0 || d.tree.rows > 0
 }
@@ -72,22 +78,37 @@ func (s *browserObservations) observeAction(name string, args, result json.RawMe
 	snapshots := snapshotTexts(texts)
 	current := observationFromText(name, texts, len(snapshots) > 0)
 	before := s.latest
-	if startsNewBrowserPage(name, args) || before.pageChanged(current) {
+	newPage := startsNewBrowserPage(name, args) || before.pageChanged(current)
+	if newPage {
 		before.snapshot = nil
+		before.pageRevision++
 	}
+	current.pageRevision = before.pageRevision
 	if s.artifacts == nil {
 		s.artifacts = make(map[string]bool)
 	}
 	collectArtifacts(texts, output, s.artifacts)
 
 	if len(snapshots) == 0 || name == "browser_snapshot" && scopedBrowserSnapshot(args) {
+		before.snapshotFresh = false
+		if newPage {
+			before.url, before.title, before.status, before.console = "", "", "", ""
+			before.tabs, before.activeTab = nil, ""
+		}
+		if current.url != "" {
+			before.url, before.title = current.url, current.title
+		}
+		if current.hasPageHeader {
+			before.status, before.console = current.status, current.console
+		}
 		if current.tabs != nil {
 			before.tabs, before.activeTab = current.tabs, current.activeTab
 		}
 		s.latest = before
 		return result
 	}
-	if len(snapshots) == 1 && current.url != "" && current.activeTab != "" {
+	current.snapshotFresh = len(snapshots) == 1 && current.url != "" && current.activeTab != ""
+	if current.snapshotFresh {
 		if before.snapshot != nil && before.snapshot.text == snapshots[0] {
 			current.snapshot = before.snapshot
 		} else {
@@ -179,25 +200,25 @@ func compareObservation(before, current browserObservation) browserObservationDi
 	return diff
 }
 
-// browserStepDiff reports what one workflow step changed. A page change or a
-// changed tree that the branch diff cannot align still counts as a meaningful
-// change, so an assertion that missed sees ambiguous rather than fail. A
-// browser_snapshot step only reads the page; its own baseline is not an action.
+// browserStepDiff keeps assertion data independent of the compact display.
+// A snapshot step establishes a baseline and has no changes of its own.
 func browserStepDiff(tool string, before, after browserObservation) browserObservationDiff {
 	if tool == "browser_snapshot" {
-		return browserObservationDiff{}
+		return browserObservationDiff{completeRead: true, elements: &browserElementChanges{}}
 	}
 	diff := compareObservation(before, after)
-	if before.url != after.url || before.activeTab != after.activeTab {
-		diff.pageChanged = true
+	diff.pageChanged = before.pageRevision != after.pageRevision || before.url != after.url || before.activeTab != after.activeTab
+	diff.completeRead = before.snapshotFresh && after.snapshotFresh && before.snapshot != nil && after.snapshot != nil
+	if !diff.completeRead || diff.pageChanged {
+		return diff
 	}
-	switch {
-	case before.snapshot == nil && after.snapshot == nil:
-	case before.snapshot == nil || after.snapshot == nil:
-		diff.pageChanged = true
-	case before.snapshot != after.snapshot:
-		if !diff.tree.compare(before.snapshot.root, after.snapshot.root) && diff.tree.rows == 0 {
-			diff.pageChanged = true
+	diff.treeChanged = before.snapshot.text != after.snapshot.text
+	if !diff.treeChanged {
+		diff.elements = &browserElementChanges{}
+	} else if before.snapshot.alignsWith(after.snapshot) {
+		diff.elements = compareBrowserElements(before.snapshot, after.snapshot)
+		if !diff.tree.compare(before.snapshot.root, after.snapshot.root) {
+			diff.tree = browserTreeDiff{}
 		}
 	}
 	return diff
@@ -209,6 +230,7 @@ func observationFromText(name string, texts []string, hasSnapshot bool) browserO
 	for _, text := range texts {
 		if match := pageURL.FindStringSubmatch(text); match != nil {
 			observation.url = strings.TrimSpace(match[1])
+			observation.hasPageHeader = true
 		}
 		if match := pageTitle.FindStringSubmatch(text); match != nil {
 			observation.title = strings.TrimSpace(match[1])
@@ -226,6 +248,12 @@ func observationFromText(name string, texts []string, hasSnapshot bool) browserO
 	}
 	if observation.tabs == nil && hasSnapshot {
 		observation.tabs, observation.activeTab = singleTab(observation.url, observation.title)
+	}
+	if !observation.hasPageHeader {
+		index, _, _ := strings.Cut(observation.activeTab, ": ")
+		if match := openTabLine.FindStringSubmatch(observation.tabs[index]); match != nil {
+			observation.title, observation.url = match[2], match[3]
+		}
 	}
 	return observation
 }
@@ -328,6 +356,9 @@ func (d browserObservationDiff) render() string {
 	}
 	if d.pageChanged {
 		out.WriteString("- page changed\n")
+	}
+	if d.treeChanged && d.tree.rows == 0 {
+		out.WriteString("- accessibility tree changed; see the full snapshot\n")
 	}
 	for _, tab := range d.tabsAdded {
 		fmt.Fprintf(&out, "- tabs added: %s\n", tab)

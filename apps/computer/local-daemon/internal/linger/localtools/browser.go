@@ -41,6 +41,10 @@ var errBrowserBusy = errors.New("BROWSER_BUSY: the user's Chrome is in use by an
 // runs in its Agent's browser lane, beside desktop input and other Agents'
 // browser calls.
 func (op *operation) nativeBrowserCall(ctx context.Context, name string, args json.RawMessage) (output json.RawMessage, callErr error) {
+	plan, _ := ctx.Value(reviewedBrowserWorkflowKey{}).(*browserPreparedWorkflow)
+	if name == browserRunStepsTool && plan == nil {
+		return nil, fmt.Errorf("%w: browser workflow requires a reviewed plan", errNotSent)
+	}
 	op.manager.retryCleanup()
 	// Calls of one task take turns from here on: switching to the owner's
 	// Chrome below ends the session an earlier call may still be using.
@@ -122,7 +126,7 @@ func (op *operation) nativeBrowserCall(ctx context.Context, name string, args js
 		}
 	}()
 	if chrome != nil {
-		return op.userChromeCall(ctx, chrome, name, args, &confirmed)
+		return op.userChromeCall(ctx, chrome, name, args, plan, &confirmed)
 	}
 	if op.nativeBrowser == nil {
 		op.nativeBrowser, err = op.manager.nativeBrowserFor(ctx, op.spec.AgentID)
@@ -148,8 +152,12 @@ func (op *operation) nativeBrowserCall(ctx context.Context, name string, args js
 		}
 		op.browserObservations = browserObservations{}
 	}
-	if name == browserRunStepsTool {
-		return op.runBrowserSteps(ctx, args, &confirmed)
+	if plan != nil {
+		report, err := op.runBrowserSteps(ctx, *plan, &confirmed)
+		if err != nil {
+			return nil, err
+		}
+		return browserWorkflowResult(report), nil
 	}
 	result, err := op.requestBrowser(ctx, name, args)
 	confirmed = !errors.Is(err, errOutcomeUnknown)
@@ -160,7 +168,7 @@ func (op *operation) nativeBrowserCall(ctx context.Context, name string, args js
 // closes that browser; it owns only the Playwright child behind the extension,
 // which later tasks of the same Agent reuse.
 // A rejected token fails the call: it never falls back to the Agent profile.
-func (op *operation) userChromeCall(ctx context.Context, chrome *browserConnection, name string, args json.RawMessage, confirmed *bool) (json.RawMessage, error) {
+func (op *operation) userChromeCall(ctx context.Context, chrome *browserConnection, name string, args json.RawMessage, plan *browserPreparedWorkflow, confirmed *bool) (json.RawMessage, error) {
 	if data := chromeUserDataDirectory(op.manager.env); name == "browser_file_upload" && uploadsFiles(args) && data != "" && extensionFileAccessOff(filepath.Join(data, chrome.Profile)) {
 		*confirmed = true
 		return nil, errUserChromeFileAccess
@@ -178,14 +186,20 @@ func (op *operation) userChromeCall(ctx context.Context, chrome *browserConnecti
 		}
 	}
 	var result json.RawMessage
-	if name == browserRunStepsTool {
-		result, err = op.runBrowserSteps(ctx, args, confirmed)
+	var workflow browserWorkflowReport
+	if plan != nil {
+		workflow, err = op.runBrowserSteps(ctx, *plan, confirmed)
+		if err == nil {
+			result = browserWorkflowResult(workflow)
+		}
 	} else {
 		result, err = op.requestBrowser(ctx, name, args)
 		*confirmed = !errors.Is(err, errOutcomeUnknown)
 	}
 	failure := err
-	if failure == nil {
+	if failure == nil && plan != nil && workflow.Status == "error" {
+		failure = errors.New(workflow.Error)
+	} else if failure == nil {
 		failure = toolResultError(result)
 	}
 	if failure != nil && strings.Contains(failure.Error(), "did not connect within") {

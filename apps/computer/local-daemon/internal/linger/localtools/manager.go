@@ -174,6 +174,7 @@ type operation struct {
 	servers              []*toolServer
 	browserCatalog       *mcpClient
 	browser              *mcpClient
+	reviewWorkflow       func(context.Context, json.RawMessage) error
 	// userChromeSession is the shared connection behind browser in the
 	// owner's everyday Chrome; the Operation returns it instead of closing it.
 	userChromeSession *userChromeSession
@@ -264,6 +265,9 @@ func (m *Manager) Bind(ctx context.Context, spec provider.OperationSpec, identit
 	}
 	opCtx, cancel := context.WithCancel(ctx)
 	op := &operation{manager: m, spec: spec, identity: identity, directory: directory, ctx: opCtx, cancel: cancel, label: "linger-" + rand.Text()}
+	op.reviewWorkflow = func(ctx context.Context, plan json.RawMessage) error {
+		return set.ReviewTool(ctx, "browser", browserRunStepsTool, plan)
+	}
 	var err error
 	// The owner's saved connection, read now, applies to this whole task.
 	// Operation input never supplies a browser credential.
@@ -304,7 +308,7 @@ func (m *Manager) Bind(ctx context.Context, spec provider.OperationSpec, identit
 		for _, tool := range binding.tools {
 			names = append(names, tool.Name)
 		}
-		if err := set.AddLocal(mcpproxy.LocalBinding{Name: binding.name, URL: server.url, ToolNames: names, WaitReady: server.waitReady, Close: op.close, Evidence: op.guard(binding.evidence), Allowed: binding.allowed}); err != nil {
+		if err := set.AddLocal(mcpproxy.LocalBinding{Name: binding.name, URL: server.url, ToolNames: names, WaitReady: server.waitReady, Close: op.close, Evidence: op.guard(binding.evidence), Allowed: binding.allowed, BindScheduling: server.bindScheduling}); err != nil {
 			return errors.Join(err, op.close())
 		}
 	}
@@ -512,7 +516,13 @@ func (op *operation) computerCall(ctx context.Context, name string, args json.Ra
 }
 
 func (op *operation) browserCall(ctx context.Context, name string, args json.RawMessage) (json.RawMessage, error) {
-	if err := op.refuseBrowserOnChromeSite(name, args); err != nil {
+	if name == browserRunStepsTool {
+		plan, err := op.prepareReviewedBrowserWorkflow(ctx, args)
+		if err != nil {
+			return nil, err
+		}
+		ctx = context.WithValue(ctx, reviewedBrowserWorkflowKey{}, &plan)
+	} else if err := op.refuseBrowserOnChromeSite(name, args); err != nil {
 		return nil, err
 	}
 	return op.nativeBrowserCall(ctx, name, args)

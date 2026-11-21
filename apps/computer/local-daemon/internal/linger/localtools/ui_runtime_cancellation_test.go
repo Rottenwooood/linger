@@ -146,6 +146,69 @@ func TestUnifiedUICancellationDrainsDispatchedAction(t *testing.T) {
 	}
 }
 
+func TestUnifiedUICancellationStopsLaterWorkflowSteps(t *testing.T) {
+	entered := make(chan struct{})
+	finished := make(chan browserWorkflowReport, 1)
+	var calls atomic.Int32
+	f := newUIRuntimeFixture(t, false, func(ctx context.Context, name string, args json.RawMessage) (json.RawMessage, error) {
+		if name != browserRunStepsTool {
+			return nil, errors.New("expected a workflow call")
+		}
+		plan, err := prepareBrowserWorkflow(args, "")
+		if err != nil {
+			return nil, err
+		}
+		report, err := runBrowserWorkflow(ctx, plan, func(context.Context, string, json.RawMessage) (json.RawMessage, error) {
+			if calls.Add(1) != 1 {
+				return nil, errors.New("a subsequent action was dispatched")
+			}
+			close(entered)
+			wait, stop := schedulingContext(ctx)
+			defer stop()
+			<-wait.Done()
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return uiTextResult("first action completed"), nil
+		}, func() browserObservation { return browserObservation{} })
+		finished <- report
+		if err != nil {
+			return nil, err
+		}
+		return browserWorkflowResult(report), nil
+	})
+	clear, err := f.set.RegisterToolReviewer(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear()
+	requestCtx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	body, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": f.sequence.Add(1), "method": "tools/call",
+		"params": map[string]any{"name": "ui_exec", "arguments": map[string]any{
+			"code": `await ui.browser.run_steps({steps:[{tool:"browser_click"},{tool:"browser_click"}]});`, "timeout_ms": 30000,
+		}}})
+	go func() { _, _, err := cancellationPost(requestCtx, f.url, body); done <- err }()
+	select {
+	case <-entered:
+	case err := <-done:
+		t.Fatalf("workflow request ended before its first action: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("first workflow action did not start")
+	}
+	cancel()
+	select {
+	case report := <-finished:
+		if calls.Load() != 1 || report.StepsCompleted != 1 || report.ResumeFrom != 2 || len(report.Steps) != 2 ||
+			report.Steps[0].ActionOutcome != browserStepConfirmed || report.Steps[1].ActionOutcome != browserStepNotDispatched {
+			t.Fatalf("workflow lost the known completion or admitted the second action: %+v", report)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("workflow did not receive the caller's cancellation")
+	}
+}
+
 type uiCancellationSummary struct {
 	IsError    bool `json:"isError"`
 	Structured struct {

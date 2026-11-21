@@ -12,8 +12,9 @@ import (
 
 // ToolEndpoint identifies an Operation-local driver kept outside the JavaScript context.
 type ToolEndpoint struct {
-	Name string
-	URL  string
+	Name           string
+	URL            string
+	BindScheduling func(context.Context, uint64) func()
 }
 
 type toolOrchestrator struct {
@@ -31,7 +32,7 @@ func (s *Set) ComputerEndpoints() []ToolEndpoint {
 	var endpoints []ToolEndpoint
 	for _, b := range s.local {
 		if (b.Name == "computer" || b.Name == "browser") && !s.hidden[b.URL] {
-			endpoints = append(endpoints, ToolEndpoint{Name: b.Name, URL: b.URL})
+			endpoints = append(endpoints, ToolEndpoint{Name: b.Name, URL: b.URL, BindScheduling: b.BindScheduling})
 		}
 	}
 	return endpoints

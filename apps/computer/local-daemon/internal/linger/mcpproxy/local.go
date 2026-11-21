@@ -33,6 +33,9 @@ type LocalBinding struct {
 	Allowed func(tool string, input json.RawMessage) bool
 	// Timeout bounds an orchestration call; zero uses the ordinary tool limit.
 	Timeout time.Duration
+	// BindScheduling links nested calls to the caller's scheduling lifetime
+	// while the driver's hard deadline remains independent.
+	BindScheduling func(context.Context, uint64) func()
 }
 
 func (s *Set) AddLocal(binding LocalBinding) error {
