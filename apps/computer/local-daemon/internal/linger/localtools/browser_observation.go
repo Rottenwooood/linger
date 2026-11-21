@@ -31,6 +31,7 @@ type browserObservation struct {
 
 type browserObservationDiff struct {
 	tree         browserTreeDiff
+	pageChanged  bool
 	titleChanged bool
 	fromTitle    string
 	toTitle      string
@@ -43,7 +44,7 @@ type browserObservationDiff struct {
 }
 
 func (d browserObservationDiff) meaningful() bool {
-	return d.titleChanged || d.statusLine != "" || d.consoleLine != "" ||
+	return d.pageChanged || d.titleChanged || d.statusLine != "" || d.consoleLine != "" ||
 		len(d.tabsAdded) > 0 || len(d.tabsRemoved) > 0 || len(d.tabsChanged) > 0 ||
 		len(d.downloads) > 0 || d.tree.rows > 0
 }
@@ -178,6 +179,30 @@ func compareObservation(before, current browserObservation) browserObservationDi
 	return diff
 }
 
+// browserStepDiff reports what one workflow step changed. A page change or a
+// changed tree that the branch diff cannot align still counts as a meaningful
+// change, so an assertion that missed sees ambiguous rather than fail. A
+// browser_snapshot step only reads the page; its own baseline is not an action.
+func browserStepDiff(tool string, before, after browserObservation) browserObservationDiff {
+	if tool == "browser_snapshot" {
+		return browserObservationDiff{}
+	}
+	diff := compareObservation(before, after)
+	if before.url != after.url || before.activeTab != after.activeTab {
+		diff.pageChanged = true
+	}
+	switch {
+	case before.snapshot == nil && after.snapshot == nil:
+	case before.snapshot == nil || after.snapshot == nil:
+		diff.pageChanged = true
+	case before.snapshot != after.snapshot:
+		if !diff.tree.compare(before.snapshot.root, after.snapshot.root) && diff.tree.rows == 0 {
+			diff.pageChanged = true
+		}
+	}
+	return diff
+}
+
 // observationFromText reads the page header and tabs that frame a snapshot.
 func observationFromText(name string, texts []string, hasSnapshot bool) browserObservation {
 	var observation browserObservation
@@ -300,6 +325,9 @@ func (d browserObservationDiff) render() string {
 	}
 	if d.consoleLine != "" {
 		fmt.Fprintf(&out, "- console: %s\n", d.consoleLine)
+	}
+	if d.pageChanged {
+		out.WriteString("- page changed\n")
 	}
 	for _, tab := range d.tabsAdded {
 		fmt.Fprintf(&out, "- tabs added: %s\n", tab)

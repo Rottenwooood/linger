@@ -325,15 +325,48 @@ func (op *operation) refuseOtherBrowserOnChromeSite(urls []string) error {
 // the browser tools drive Chrome through its debugging protocol, which such
 // sites detect. Every other site stays open to the browser tools.
 func (op *operation) refuseBrowserOnChromeSite(name string, args json.RawMessage) error {
-	var params struct {
-		URL string `json:"url"`
+	if name == browserRunStepsTool {
+		prepared, err := prepareBrowserWorkflow(args, op.spec.WorkingDirectory)
+		if err != nil {
+			// The workflow itself will be refused before it sends a command;
+			// no address can be checked without a valid step list.
+			return nil //nolint:nilerr // an invalid workflow cannot open a site
+		}
+		return op.refuseBrowserWorkflow(prepared)
 	}
 	if name != "browser_navigate" && name != "browser_tabs" {
 		return nil
 	}
-	// Arguments that do not decode name no URL, so there is no site to refuse.
-	_ = json.Unmarshal(args, &params)
-	site := siteOf(params.URL)
+	var params struct {
+		URL string `json:"url"`
+	}
+	if json.Unmarshal(args, &params) != nil {
+		return nil //nolint:nilerr // arguments that do not decode name no URL
+	}
+	return op.refuseBrowserAddress(params.URL, name)
+}
+
+// refuseBrowserWorkflow checks every remaining step address. The tool call
+// runs it again after loading a saved workflow, so a file changed between the
+// review and the call cannot open a site this task keeps out of the browser.
+func (op *operation) refuseBrowserWorkflow(prepared browserPreparedWorkflow) error {
+	for index := browserWorkflowStart(prepared) - 1; index < len(prepared.Steps); index++ {
+		step := prepared.Steps[index]
+		address := browserWorkflowURL(step)
+		if address == "" {
+			continue
+		}
+		if err := op.refuseBrowserAddress(address, fmt.Sprintf("step %d (%s)", index+1, step.Tool)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// refuseBrowserAddress keeps the browser tools off a site that this task
+// opened in the Computer's own browser or that is cooling down.
+func (op *operation) refuseBrowserAddress(address, label string) error {
+	site := siteOf(address)
 	if site == "" {
 		return nil
 	}
@@ -341,7 +374,10 @@ func (op *operation) refuseBrowserOnChromeSite(name string, args json.RawMessage
 	opened := op.chromeSites[site]
 	op.mu.Unlock()
 	if opened {
-		return fmt.Errorf("COMPUTER_BROWSER_REFUSED: this task uses %s in the Computer's own browser, so the browser tools stay off that site; keep working with the computer tools in that browser", site)
+		return fmt.Errorf("COMPUTER_BROWSER_REFUSED: this task uses %s in the Computer's own browser, so the browser tools stay off that site (%s); keep working with the computer tools in that browser: %w", site, label, errNotSent)
+	}
+	if op.manager == nil {
+		return nil
 	}
 	if err := op.manager.coolingSite([]string{site}); err != nil {
 		return fmt.Errorf("COMPUTER_BROWSER_REFUSED: %w", err)

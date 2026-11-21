@@ -15,6 +15,7 @@ type browserSnapshot struct {
 	root  browserSnapshotNode
 	order []string
 	owner map[string]string
+	nodes map[string]*browserSnapshotNode
 }
 
 type browserSnapshotNode struct {
@@ -33,14 +34,24 @@ func parseBrowserSnapshot(text string) *browserSnapshot {
 		return nil
 	}
 	lines := strings.Split(text, "\n")
-	tree := &browserSnapshot{text: text, owner: make(map[string]string)}
+	tree := &browserSnapshot{text: text, owner: make(map[string]string), nodes: make(map[string]*browserSnapshotNode)}
 	next := 0
 	children, ok := tree.parseChildren(document.Content[0], lines, &next, "")
 	if !ok || next != len(lines) {
 		return nil
 	}
 	tree.root = browserSnapshotNode{rows: lines, children: children}
+	tree.index(&tree.root)
 	return tree
+}
+
+func (s *browserSnapshot) index(node *browserSnapshotNode) {
+	if node.ref != "" {
+		s.nodes[node.ref] = node
+	}
+	for i := range node.children {
+		s.index(&node.children[i])
+	}
 }
 
 // Playwright's tree has one sequence item per rendered line. A format we

@@ -447,7 +447,7 @@ func (m *Manager) discoverCatalog(ctx context.Context, op *operation) (*toolCata
 	op.browserCatalog = nil
 	// Installation and arbitrary executable-code tools would escape the
 	// managed browser lifecycle. Keep the pinned ordinary browser tool set.
-	browserTools = filterBrowserTools(browserTools)
+	browserTools = append(filterBrowserTools(browserTools), browserRunStepsToolDefinition())
 	return &toolCatalog{computer: computerTools, browser: browserTools}, nil
 }
 
@@ -722,6 +722,9 @@ func describeBrowserMode(tools []tool, userChrome, chromeRequired, connectable b
 		}
 		if tools[index].Name == "browser_snapshot" {
 			tools[index].Description += " Call without arguments for the full page. Same-page actions may return a snapshot diff."
+		}
+		if tools[index].Name == browserRunStepsTool {
+			tools[index].Description += note + siteSkillNote
 		}
 	}
 	return tools

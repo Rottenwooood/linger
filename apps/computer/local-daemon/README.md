@@ -422,6 +422,13 @@ arguments for the full page. A snapshot of a target or limited depth leaves
 the full-page baseline intact. Only links under `.linger/browser-output/`
 are replaced.
 
+`ui.browser.run_steps({steps, workflow?, save?, params?, start_step?})` runs
+planned browser actions and evaluates each step's checkpoint. A step is
+`{tool, args?, checkpoint?, wait_ms?}`. The call stops at the first `fail` or
+`ambiguous`, returns the failed step, its diff and `resume_from`, and keeps the
+page scene. `save` stores the steps in `.linger/browser-workflows/<name>.json`;
+`params` fills `$NAME` placeholders; `start_step` resumes a saved workflow.
+
 A Codex Context home receives the public entry as a URL server in its projected
 `config.toml`, together with `mcp_oauth_credentials_store = "file"`. Codex
 otherwise reads the OAuth credentials of every URL server from the OS keyring,

@@ -148,6 +148,9 @@ func (op *operation) nativeBrowserCall(ctx context.Context, name string, args js
 		}
 		op.browserObservations = browserObservations{}
 	}
+	if name == browserRunStepsTool {
+		return op.runBrowserSteps(ctx, args, &confirmed)
+	}
 	result, err := op.requestBrowser(ctx, name, args)
 	confirmed = !errors.Is(err, errOutcomeUnknown)
 	return result, err
@@ -174,8 +177,13 @@ func (op *operation) userChromeCall(ctx context.Context, chrome *browserConnecti
 			return nil, err
 		}
 	}
-	result, err := op.requestBrowser(ctx, name, args)
-	*confirmed = !errors.Is(err, errOutcomeUnknown)
+	var result json.RawMessage
+	if name == browserRunStepsTool {
+		result, err = op.runBrowserSteps(ctx, args, confirmed)
+	} else {
+		result, err = op.requestBrowser(ctx, name, args)
+		*confirmed = !errors.Is(err, errOutcomeUnknown)
+	}
 	failure := err
 	if failure == nil {
 		failure = toolResultError(result)

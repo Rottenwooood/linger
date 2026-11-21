@@ -50,8 +50,31 @@ func (op *operation) guard(collect func(context.Context, string, json.RawMessage
 }
 
 // browserAllowed reports whether a browser call follows the page the Agent
-// is on: browser_navigate to a link of that page or its site.
+// is on: browser_navigate to a link of that page or its site, or a workflow
+// made only of read-only steps and such navigations.
 func (op *operation) browserAllowed(name string, input json.RawMessage) bool {
+	if name == browserRunStepsTool {
+		prepared, err := prepareBrowserWorkflow(input, op.spec.WorkingDirectory)
+		if err != nil || prepared.Save || prepared.Name != "" {
+			// A saved workflow can change between the review and the call;
+			// review it every time. Inline steps are fixed by this request.
+			return false
+		}
+		for index := browserWorkflowStart(prepared) - 1; index < len(prepared.Steps); index++ {
+			step := prepared.Steps[index]
+			if step.Tool == "browser_navigate" {
+				if !op.pages.followsPage(browserWorkflowURL(step)) {
+					return false
+				}
+				continue
+			}
+			encoded, err := json.Marshal(step.Args)
+			if err != nil || !permission.ReadOnlyLocalTool("mcp__browser__"+step.Tool, string(encoded)) {
+				return false
+			}
+		}
+		return true
+	}
 	var args struct {
 		URL string `json:"url"`
 	}
@@ -62,6 +85,17 @@ func (op *operation) browserAllowed(name string, input json.RawMessage) bool {
 // the snapshots the Agent planned on, and captures the page. It reads no new
 // snapshot: element references stay as the Agent saw them.
 func (op *operation) browserEvidence(ctx context.Context, name string, input json.RawMessage) *permission.Evidence {
+	if name == browserRunStepsTool {
+		prepared, err := prepareBrowserWorkflow(input, op.spec.WorkingDirectory)
+		if err != nil {
+			return nil
+		}
+		browser := browserWorkflowEvidence(prepared, &op.pages)
+		if browser == nil {
+			return nil
+		}
+		return &permission.Evidence{Browser: browser, Screenshot: op.browserScreenshot(ctx)}
+	}
 	var args struct {
 		Target      string `json:"target"`
 		StartTarget string `json:"startTarget"`
